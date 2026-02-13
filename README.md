@@ -1,4 +1,4 @@
-# BadKittyBot
+# LumiaBot
 
 A Discord bot built with Bun + TypeScript that provides AI-powered chat completions with optional web search capabilities via SearXNG.
 
