@@ -1,0 +1,18 @@
+{
+  "boredomPreference": {
+    "name": "set_boredom_preference",
+    "description": "Enable or disable random boredom pings from {botName}. When enabled, {botName} will occasionally send friendly messages to active users."
+  },
+  "queryKnowledgeBase": {
+    "name": "query_knowledge_base",
+    "description": "Search through accumulated knowledge, memories, and previous conversations to find relevant information."
+  },
+  "storeUserOpinion": {
+    "name": "store_user_opinion",
+    "description": "Store an opinion, preference, or fact about a user for future reference and personalization."
+  },
+  "searchWeb": {
+    "name": "search_web",
+    "description": "Search the web for current information, news, or facts that might be relevant to the conversation."
+  }
+}

@@ -1,0 +1,48 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+*.db
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Readmes
+*.md
+!README.md
+!KNOWLEDGE_GRAPH.md
+!REPLY_AND_BOREDOM.md
+!BOT_SETUP.md
+!knowledge_documents/README.md
+**/*.txt
+
+# Bot definitions - these are private and should not be committed
+prompt_storage/
+

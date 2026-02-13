@@ -1,0 +1,8 @@
+{
+  "multiple_attempts_failure": "I'm having a bit of trouble processing that right now. Could you try asking in a slightly different way?",
+  "empty_response": "Hmm, I'm not sure I understood that correctly. Could you rephrase your question?",
+  "generic_error": "Oops! Something went wrong on my end. Mind trying again?",
+  "guild_only_error": "That command only works in Discord servers, not in direct messages!",
+  "permission_denied": "I don't seem to have permission to do that. Could you check my role permissions?",
+  "feature_disabled": "That feature isn't available right now. Sorry about that!"
+}

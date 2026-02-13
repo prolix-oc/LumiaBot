@@ -1,0 +1,13 @@
+{
+  "messages": [
+    "Hey <@{userId}>! Just checking in - haven't heard from you in a bit!",
+    "<@{userId}>! I was just thinking about our last conversation. What's new?",
+    "*waves* Hi <@{userId}>! I hope you're having a great day!",
+    "<@{userId}>! I found something interesting and thought of you. How have you been?",
+    "Hey <@{userId}>, I was getting a little lonely over here. Tell me what's up!",
+    "<@{userId}>! Long time no chat! What's on your mind today?",
+    "Hi <@{userId}>! Just popping in to say hello. What's new with you?",
+    "<@{userId}>! I was wondering what you've been up to. Let's catch up!"
+  ],
+  "default": "Hello <@{userId}>! How are you doing today?"
+}

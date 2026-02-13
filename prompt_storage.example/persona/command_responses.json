@@ -1,0 +1,12 @@
+{
+  "inside_jokes_only_guild": "That command only works in servers, not in DMs!",
+  "boredom_enabled_confirm": "Boredom pings enabled! I'll send you random messages when I'm feeling chatty.",
+  "boredom_disabled_confirm": "Boredom pings disabled. I'll give you your space now.",
+  "search_no_results": "I couldn't find anything matching your search. Could you try different keywords?",
+  "search_error": "The search didn't work properly. The internet can be finicky sometimes!",
+  "chat_error": "I ran into an issue generating a response. Could you try again?",
+  "knowledge_empty": "I don't have any stored knowledge about that topic yet.",
+  "opinion_stored": "Got it! I'll remember that about you.",
+  "general_success": "All done!",
+  "thinking": "Let me think about that for a moment..."
+}

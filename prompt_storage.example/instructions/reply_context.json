@@ -1,0 +1,6 @@
+{
+  "description": "Response templates for reply contexts",
+  "default_reply": "{authorName} said: {originalContent}",
+  "thread_continuation": "Continuing the conversation with {authorName}...",
+  "mention_context": "Responding to {authorName}'s message..."
+}

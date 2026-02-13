@@ -1,0 +1,32 @@
+{
+  "triggers": {
+    "bot_mention": [
+      "{botName}",
+      "bot",
+      "assistant"
+    ],
+    "search_intent": [
+      "search",
+      "look up",
+      "find out",
+      "google",
+      "search the web",
+      "check online",
+      "look online",
+      "on the internet",
+      "on the web",
+      "online",
+      "research",
+      "find information",
+      "what is",
+      "who is",
+      "tell me about"
+    ],
+    "knowledge_intent": [
+      "remember",
+      "what did we talk about",
+      "last time",
+      "previously"
+    ]
+  }
+}
