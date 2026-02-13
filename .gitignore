@@ -40,6 +40,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 !KNOWLEDGE_GRAPH.md
 !REPLY_AND_BOREDOM.md
 !BOT_SETUP.md
+!LICENSE.md
 !knowledge_documents/README.md
 **/*.txt
 
