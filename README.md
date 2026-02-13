@@ -23,7 +23,7 @@ A Discord bot built with Bun + TypeScript that provides AI-powered chat completi
 
 1. **Clone the repository** (or create from scratch):
 ```bash
-cd BadKittyBot
+cd LumiaBot
 ```
 
 2. **Install dependencies**:
@@ -192,7 +192,7 @@ Once the bot is running and invited to your server, use these slash commands:
 ## Project Structure
 
 ```
-BadKittyBot/
+LumiaBot/
 ├── src/
 │   ├── bot/
 │   │   └── client.ts          # Discord client setup
