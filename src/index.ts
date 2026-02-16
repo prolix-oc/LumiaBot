@@ -1,6 +1,7 @@
 import { bot } from './bot/client';
-import { validateConfig } from './utils/config';
+import { validateConfig, config } from './utils/config';
 import { loadBotDefinition } from './utils/bot-definition';
+import { setTemplateVariables } from './services/prompts';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +29,15 @@ async function main() {
     // Validate environment configuration
     validateConfig();
     console.log('Configuration validated successfully');
+
+    // Apply bot template variables from environment
+    setTemplateVariables({
+      botName: config.bot.name,
+      ownerName: config.bot.ownerName,
+      ownerId: config.bot.ownerId,
+      ownerUsername: config.bot.ownerUsername,
+    });
+    console.log(`Bot configured as: ${config.bot.name}`);
 
     // Load bot definition from bot.txt
     loadBotDefinition();

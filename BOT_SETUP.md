@@ -78,10 +78,12 @@ You are {botName}, a [brief description of your bot].
 ```
 
 **Template Variables:**
-- `{botName}` - The bot's name (from environment or defaults to "Bot")
-- `{ownerName}` - The owner's name (from environment or defaults to "Owner")
-- `{ownerId}` - Owner's Discord ID
-- `{ownerUsername}` - Owner's Discord username
+- `{botName}` - The bot's name (configured via `BOT_NAME` env var, defaults to "Bad Kitty")
+- `{ownerName}` - The owner's name (configured via `BOT_OWNER_NAME` env var, defaults to "Prolix")
+- `{ownerId}` - Owner's Discord ID (configured via `BOT_OWNER_ID` env var)
+- `{ownerUsername}` - Owner's Discord username (configured via `BOT_OWNER_USERNAME` env var)
+
+See the [Template Variables Reference](#template-variables-reference) section for details on configuring these via environment variables.
 
 ### 2. config/triggers.json
 
@@ -285,10 +287,21 @@ When using search:
 Variables in `{curlyBraces}` are automatically replaced at runtime:
 
 **Global Variables (available in most files):**
-- `{botName}` - The bot's display name
-- `{ownerName}` - The bot owner's name
-- `{ownerId}` - Owner's Discord user ID
-- `{ownerUsername}` - Owner's Discord username
+
+These variables can be configured via environment variables (see `.env.example`):
+
+| Template Variable | Environment Variable | Default Value | Description |
+|------------------|---------------------|---------------|-------------|
+| `{botName}` | `BOT_NAME` | `Bad Kitty` | The bot's display name used throughout prompts |
+| `{ownerName}` | `BOT_OWNER_NAME` | `Prolix` | The bot owner's preferred name |
+| `{ownerId}` | `BOT_OWNER_ID` | `944783522059673691` | Owner's Discord user ID for special recognition |
+| `{ownerUsername}` | `BOT_OWNER_USERNAME` | `prolix_oc` | Owner's Discord username |
+
+**How it works:**
+1. Set the environment variables in your `.env` file (optional)
+2. These values are loaded at startup and applied to all template substitutions
+3. If not set, the defaults shown above are used
+4. Changes require a bot restart to take effect
 
 **Context-Specific Variables:**
 - `{userId}` - The target user's Discord ID (boredom messages)

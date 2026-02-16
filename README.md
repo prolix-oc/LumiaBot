@@ -60,6 +60,13 @@ DISCORD_CLIENT_ID=your_discord_application_id_here
 DISCORD_CLIENT_SECRET=your_discord_client_secret_here
 DISCORD_REDIRECT_URI=http://localhost:3000/auth/callback
 
+# Bot Identity Configuration (Optional)
+# These values are used as template variables in prompt_storage files
+# BOT_NAME=Bad Kitty                    # Bot's display name
+# BOT_OWNER_NAME=Prolix                 # Owner's name
+# BOT_OWNER_ID=944783522059673691       # Owner's Discord ID
+# BOT_OWNER_USERNAME=prolix_oc          # Owner's Discord username
+
 # OpenAI Configuration
 OPENAI_API_KEY=your_openai_api_key_here
 # OPENAI_BASE_URL=https://api.openai.com/v1  # Optional: Custom API base URL (e.g., for OpenRouter, Together AI)
@@ -77,6 +84,25 @@ SEARXNG_SAFE_SEARCH=1
 # Server Configuration
 PORT=3000
 ```
+
+### Bot Identity Configuration
+
+You can customize your bot's identity and owner information through environment variables. These values are used as template variables (e.g., `{botName}`, `{ownerName}`) in your prompt_storage files:
+
+```env
+# Optional - Bot identity (defaults shown)
+BOT_NAME=Bad Kitty                    # Bot's display name
+BOT_OWNER_NAME=Prolix                 # Owner's name
+BOT_OWNER_ID=944783522059673691       # Owner's Discord ID
+BOT_OWNER_USERNAME=prolix_oc          # Owner's Discord username
+```
+
+These variables allow you to:
+- Change the bot's name without editing prompt files
+- Set the bot's owner for special recognition in prompts
+- Maintain consistent identity across all prompt templates
+
+See `BOT_SETUP.md` for more details on using template variables in your bot's personality files.
 
 ### Using Custom AI Providers
 

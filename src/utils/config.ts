@@ -5,6 +5,12 @@ export const config = {
     clientSecret: process.env.DISCORD_CLIENT_SECRET!,
     redirectUri: process.env.DISCORD_REDIRECT_URI || 'http://localhost:3000/auth/callback',
   },
+  bot: {
+    name: process.env.BOT_NAME || 'Bad Kitty',
+    ownerName: process.env.BOT_OWNER_NAME || 'Prolix',
+    ownerId: process.env.BOT_OWNER_ID || '944783522059673691',
+    ownerUsername: process.env.BOT_OWNER_USERNAME || 'prolix_oc',
+  },
   openai: {
     apiKey: process.env.OPENAI_API_KEY!,
     baseUrl: process.env.OPENAI_BASE_URL || undefined,
