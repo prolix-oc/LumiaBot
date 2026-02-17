@@ -132,15 +132,26 @@ export class DiscordBot {
       return this.handleOrchestratorResponse(context, eventId);
     });
 
-    // Set up callback for when orchestrator says we should respond
-    // Note: Response is now sent directly in handleOrchestratorResponse
-    // This callback is kept for compatibility but the actual sending happens in the response handler
+    // Set up callback for when orchestrator says we should respond.
+    // Note: Response is now sent directly in handleOrchestratorResponse.
+    // We do NOT delete the queue entry here because follow-up turns may
+    // reuse the same eventId and need the original Discord message object.
+    // Queue entries are cleaned up by the periodic stale-entry sweep below.
     this.orchestrator.setResponseReadyCallback((eventId: string, response: string) => {
       console.log(`[Orchestrator] Response ready callback for event ${eventId} (response length: ${response.length})`);
-      // Queue is already cleaned up in handleOrchestratorResponse to prevent race conditions.
-      // This delete is a safe no-op if the entry was already removed.
-      this.orchestratorQueue.delete(eventId);
     });
+
+    // Periodically clean up stale orchestrator queue entries (older than 5 minutes).
+    // This prevents memory leaks from events that never completed or had no follow-ups.
+    setInterval(() => {
+      const staleThreshold = Date.now() - 5 * 60 * 1000;
+      for (const [eventId, info] of this.orchestratorQueue.entries()) {
+        if (info.message.createdTimestamp < staleThreshold) {
+          this.orchestratorQueue.delete(eventId);
+          console.log(`[Orchestrator] Cleaned up stale queue entry for event ${eventId}`);
+        }
+      }
+    }, 60_000);
 
     // Set up typing callback for orchestrated responses
     this.orchestrator.setTypingCallback((channelId: string, guildId: string, isTyping: boolean) => {
@@ -173,14 +184,15 @@ export class DiscordBot {
       isBanter: context.isBanter,
     });
 
-    // Look up the original message from the queue and delete immediately
-    // to prevent race conditions if multiple response_requests arrive
+    // Look up the original message from the queue but DON'T delete it —
+    // follow-up turns reuse the same eventId and need the Discord message object
+    // to call message.reply(). The queue entry is cleaned up when the orchestrator
+    // session ends (via responseReadyCallback) or on bot restart.
     const queuedInfo = this.orchestratorQueue.get(eventId);
     if (!queuedInfo) {
       console.error(`[Orchestrator] No queued message found for event ${eventId}`);
       return '';
     }
-    this.orchestratorQueue.delete(eventId);
 
     const { message, replyContext } = queuedInfo;
 
@@ -192,11 +204,63 @@ export class DiscordBot {
     }
 
     try {
+      // Extract mentioned users from the original Discord message.
+      // In orchestrator mode the message content contains raw <@id> patterns;
+      // resolving them here gives the AI system prompt the "USERS MENTIONED"
+      // section and enables user-related tools (opinions, pronouns, etc.).
+      const mentionedUsers = new Map<string, string>();
+      if (message.mentions.users.size > 0) {
+        message.mentions.users.forEach((user) => {
+          mentionedUsers.set(user.id, user.username);
+          console.log(`👥 [Orchestrator] User mentioned: ${user.username} (${user.id})`);
+        });
+      }
+
+      // Also scan previousMessages for <@id> patterns that we can resolve
+      // from the guild member cache (e.g. if another bot mentioned a user).
+      if (message.guild) {
+        const mentionPattern = /<@!?(\d+)>/g;
+        for (const prevMsg of context.previousMessages) {
+          let match: RegExpExecArray | null;
+          while ((match = mentionPattern.exec(prevMsg.content)) !== null) {
+            const userId = match[1];
+            if (userId && !mentionedUsers.has(userId)) {
+              try {
+                const member = message.guild.members.cache.get(userId);
+                if (member) {
+                  mentionedUsers.set(userId, member.user.username);
+                  console.log(`👥 [Orchestrator] Resolved mention from context: ${member.user.username} (${userId})`);
+                }
+              } catch {
+                // Silently skip unresolvable mentions
+              }
+            }
+          }
+        }
+      }
+
       // Build conversation history from context
       const channelHistory = context.previousMessages
         .filter(m => m.id !== lastMessage.id) // Exclude the current message
         .map(m => `${m.isBot ? 'Bot' : 'User'} ${m.authorName}: ${m.content}`)
         .join('\n');
+
+      // Create a working getUserListeningActivity callback using the guild
+      // from the original Discord message, matching the non-orchestrator path.
+      const getUserListeningActivity = async (targetUserId: string) => {
+        try {
+          if (!message.guild) return null;
+          const member = await message.guild.members.fetch({
+            user: targetUserId,
+            withPresences: true,
+          });
+          if (!member) return null;
+          return userActivityService.getMusicActivity(member);
+        } catch (error) {
+          console.error(`[Orchestrator] Failed to get listening activity for ${targetUserId}:`, error);
+          return null;
+        }
+      };
 
       // Generate response using the existing message handler
       const response = await handleMessage({
@@ -207,9 +271,14 @@ export class DiscordBot {
         userId: lastMessage.authorId,
         username: lastMessage.authorName,
         guildId: message.guildId || 'dm',
-        mentionedUsers: new Map(),
+        mentionedUsers,
         channelHistory: channelHistory || undefined,
-        getUserListeningActivity: async () => null,
+        getUserListeningActivity,
+        // Orchestrator follow-up support: allow the LLM to request another turn
+        orchestratorEventId: eventId,
+        requestFollowUp: this.orchestrator
+          ? (evtId, targetBotId, reason) => this.orchestrator!.requestFollowUp(evtId, targetBotId, reason)
+          : undefined,
       });
 
       // Send the response directly to Discord

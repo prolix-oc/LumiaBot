@@ -7,6 +7,8 @@ import type {
   MentionPayload,
   ResponseCompletePayload,
   ResponseRequestPayload,
+  FollowUpRequestPayload,
+  FollowUpAckPayload,
   ErrorPayload,
   LumiaBotConfig,
   ResponseHandler,
@@ -27,6 +29,7 @@ export class LumiaBotIntegration {
   private onConnectCallback: (() => void) | null = null;
   private responseReadyCallback: ((eventId: string, response: string) => void) | null = null;
   private typingCallback: TypingCallback | null = null;
+  private pendingFollowUps: Map<string, { resolve: (result: FollowUpAckPayload) => void; timeout: ReturnType<typeof setTimeout> }> = new Map();
 
   constructor(config: LumiaBotConfig) {
     this.config = {
@@ -272,6 +275,9 @@ export class LumiaBotIntegration {
         // Acknowledgement that our response was received
         console.log(`[Orchestrator] Response acknowledged: ${(message.payload as any).turnId}`);
         break;
+      case 'follow_up_ack':
+        this.handleFollowUpAck(message.payload as FollowUpAckPayload);
+        break;
       case 'banter_invite':
         console.log('[Orchestrator] Received banter invite');
         break;
@@ -368,6 +374,69 @@ export class LumiaBotIntegration {
       type: 'response_complete',
       payload,
     });
+  }
+
+  /**
+   * Request a follow-up turn from the orchestrator.
+   * Returns a promise that resolves with the ack payload (approved/denied).
+   * Called by the LLM tool execution when the model wants to reply to another bot.
+   */
+  requestFollowUp(eventId: string, targetBotId?: string, reason?: string): Promise<FollowUpAckPayload> {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected || !this.ws) {
+        resolve({
+          eventId,
+          botId: this.config.botId,
+          approved: false,
+          reason: 'not_connected',
+        });
+        return;
+      }
+
+      const payload: FollowUpRequestPayload = {
+        eventId,
+        botId: this.config.botId,
+        targetBotId,
+        reason,
+      };
+
+      // Set up a timeout to avoid hanging forever
+      const timeout = setTimeout(() => {
+        this.pendingFollowUps.delete(eventId);
+        resolve({
+          eventId,
+          botId: this.config.botId,
+          approved: false,
+          reason: 'timeout',
+        });
+      }, 10000);
+
+      this.pendingFollowUps.set(eventId, { resolve, timeout });
+
+      this.sendMessage({
+        type: 'request_follow_up',
+        payload,
+      });
+
+      console.log(`[Orchestrator] Sent follow-up request for event ${eventId}`, {
+        targetBotId,
+        reason,
+      });
+    });
+  }
+
+  private handleFollowUpAck(payload: FollowUpAckPayload): void {
+    console.log(`[Orchestrator] Follow-up ${payload.approved ? 'approved' : 'denied'} for event ${payload.eventId}: ${payload.reason}`, {
+      turnId: payload.turnId,
+      queuePosition: payload.queuePosition,
+    });
+
+    const pending = this.pendingFollowUps.get(payload.eventId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      this.pendingFollowUps.delete(payload.eventId);
+      pending.resolve(payload);
+    }
   }
 
   private sendMessage(message: any): void {

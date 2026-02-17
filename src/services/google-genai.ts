@@ -84,6 +84,9 @@ export interface ChatCompletionOptions {
   channelHistory?: string;
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
+  // Orchestrator follow-up support
+  orchestratorEventId?: string; // The event ID for the current orchestrated conversation
+  requestFollowUp?: (eventId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
 }
 
 /**
@@ -770,6 +773,24 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       });
     }
 
+    // Orchestrator follow-up tool - only available during orchestrated conversations
+    if (options.orchestratorEventId && options.requestFollowUp) {
+      tools.push({
+        name: 'request_follow_up',
+        description: `Request a follow-up turn in an orchestrated multi-bot conversation. Use this when another bot said something you want to respond to, or when the conversation naturally warrants you jumping back in. The orchestrator will approve or deny based on the max turn limit. Only use this if you genuinely have something to add — don't request follow-ups just because you can.`,
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            reason: {
+              type: Type.STRING,
+              description: 'A brief explanation of why you want a follow-up turn (e.g. "want to respond to what BotX said about music").',
+            },
+          },
+          required: ['reason'],
+        },
+      });
+    }
+
     return tools.length > 0 ? tools : undefined;
   }
 
@@ -999,6 +1020,23 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             return `- ${enabled} User ${u.userId.substring(0, 8)}... (${u.pingCount} pings, last active: ${new Date(u.lastInteraction).toLocaleDateString()})`;
           }).join('\n');
           return `Users with boredom settings in this server (${users.length} total):\n${userList}`;
+        }
+
+        case 'request_follow_up': {
+          if (!options.orchestratorEventId || !options.requestFollowUp) {
+            return 'Error: Follow-up requests are only available during orchestrated conversations.';
+          }
+          const result = await options.requestFollowUp(
+            options.orchestratorEventId,
+            undefined, // targetBotId — let orchestrator decide
+            args.reason
+          );
+          console.log(`🔧 [Google GenAI] Follow-up request result: ${result.approved ? 'approved' : 'denied'} (${result.reason})`);
+          if (result.approved) {
+            return 'Follow-up request approved! You will get another turn after the other bot(s) respond. Continue with your current response for now.';
+          } else {
+            return `Follow-up request denied: ${result.reason}. The conversation has reached its turn limit or the request was invalid.`;
+          }
         }
 
         default:

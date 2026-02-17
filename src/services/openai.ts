@@ -90,6 +90,9 @@ export interface ChatCompletionOptions {
   channelHistory?: string; // Recent channel conversation context
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
+  // Orchestrator follow-up support
+  orchestratorEventId?: string;
+  requestFollowUp?: (eventId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
 }
 
 export class OpenAIService {
@@ -1409,6 +1412,39 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             },
           }
         );
+      }
+
+      // Orchestrator follow-up tool - only available during orchestrated conversations
+      if (options.orchestratorEventId && options.requestFollowUp) {
+        const requestFollowUpFn = options.requestFollowUp;
+        const eventId = options.orchestratorEventId;
+        tools.push({
+          type: 'function',
+          function: {
+            function: async (args: { reason: string }) => {
+              const result = await requestFollowUpFn(eventId, undefined, args.reason);
+              console.log(`🔧 [AI] Follow-up request result: ${result.approved ? 'approved' : 'denied'} (${result.reason})`);
+              if (result.approved) {
+                return 'Follow-up request approved! You will get another turn after the other bot(s) respond. Continue with your current response for now.';
+              } else {
+                return `Follow-up request denied: ${result.reason}. The conversation has reached its turn limit or the request was invalid.`;
+              }
+            },
+            parse: JSON.parse,
+            description: `Request a follow-up turn in an orchestrated multi-bot conversation. Use this when another bot said something you want to respond to, or when the conversation naturally warrants you jumping back in. The orchestrator will approve or deny based on the max turn limit. Only use this if you genuinely have something to add — don't request follow-ups just because you can.`,
+            name: 'request_follow_up',
+            parameters: {
+              type: 'object',
+              properties: {
+                reason: {
+                  type: 'string',
+                  description: 'A brief explanation of why you want a follow-up turn (e.g. "want to respond to what BotX said about music").',
+                },
+              },
+              required: ['reason'],
+            },
+          },
+        });
       }
 
       // Use runTools with retry logic for empty responses

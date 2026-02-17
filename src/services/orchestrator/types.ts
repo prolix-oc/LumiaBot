@@ -72,6 +72,22 @@ export interface ResponseCompletePayload {
   nextBotId?: string;
 }
 
+export interface FollowUpRequestPayload {
+  eventId: string;
+  botId: string;
+  targetBotId?: string;
+  reason?: string;
+}
+
+export interface FollowUpAckPayload {
+  eventId: string;
+  botId: string;
+  approved: boolean;
+  reason: string;
+  turnId?: string;
+  queuePosition?: number;
+}
+
 export interface BanterInvitePayload {
   sessionId: string;
   inviterBotId: string;
@@ -97,6 +113,8 @@ export type WebSocketMessage =
   | { type: 'response_request'; payload: ResponseRequestPayload }
   | { type: 'response_complete'; payload: ResponseCompletePayload }
   | { type: 'response_ack'; payload: { turnId: string; status: string; nextBotId?: string } }
+  | { type: 'request_follow_up'; payload: FollowUpRequestPayload }
+  | { type: 'follow_up_ack'; payload: FollowUpAckPayload }
   | { type: 'banter_invite'; payload: BanterInvitePayload }
   | { type: 'error'; payload: ErrorPayload };
 

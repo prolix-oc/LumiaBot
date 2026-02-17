@@ -163,6 +163,9 @@ export interface MessageHandlerOptions {
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
   channelHistory?: string; // Recent channel conversation context
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
+  // Orchestrator follow-up support
+  orchestratorEventId?: string;
+  requestFollowUp?: (eventId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
 }
 
 export interface MessageHandlerResponse {
@@ -205,7 +208,7 @@ function extractReactions(response: string): { text: string; reactions: string[]
  * @returns The bot's response with potential reactions
  */
 export async function handleMessage(options: MessageHandlerOptions): Promise<MessageHandlerResponse> {
-  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelHistory, getUserListeningActivity } = options;
+  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelHistory, getUserListeningActivity, orchestratorEventId, requestFollowUp } = options;
 
   try {
     // Parse message for pronouns and mentions BEFORE processing
@@ -282,6 +285,8 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       boredomAction,
       channelHistory,
       getUserListeningActivity,
+      orchestratorEventId,
+      requestFollowUp,
     });
 
     // Extract reactions from the response
