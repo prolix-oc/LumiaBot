@@ -53,6 +53,18 @@ export const config = {
     // Max text file size in KB (default: 25)
     maxTextFileSizeKB: parseInt(process.env.ATTACHMENTS_MAX_TEXT_SIZE_KB || '25'),
   },
+  orchestrator: {
+    // Optional: Enable orchestrator integration for multi-bot coordination
+    enabled: process.env.ORCHESTRATOR_ENABLED === 'true',
+    url: process.env.ORCHESTRATOR_URL || 'ws://localhost:3000',
+    apiKey: process.env.ORCHESTRATOR_API_KEY || '',
+    // Unique bot identifier for the orchestrator
+    botId: process.env.ORCHESTRATOR_BOT_ID || process.env.DISCORD_CLIENT_ID || 'lumia-bot',
+    botName: process.env.ORCHESTRATOR_BOT_NAME || process.env.BOT_NAME || 'LumiaBot',
+    // Reconnection settings
+    reconnectIntervalMs: parseInt(process.env.ORCHESTRATOR_RECONNECT_INTERVAL || '5000'),
+    maxReconnectAttempts: parseInt(process.env.ORCHESTRATOR_MAX_RECONNECT || '10'),
+  },
 };
 
 /**

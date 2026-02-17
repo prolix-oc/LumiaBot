@@ -1,11 +1,13 @@
 import { Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember } from 'discord.js';
 import { config } from '../utils/config';
-import { shouldTriggerBot, extractMessageContent, handleMessage } from '../services/message-handler';
+import { shouldTriggerBot, extractMessageContent, handleMessage, extractTriggerKeywords } from '../services/message-handler';
 import { boredomService, getRandomBoredomMessage } from '../services/boredom';
 import { channelHistoryService } from '../services/channel-history';
 import { getErrorMessage } from '../services/prompts';
 import { userActivityService } from '../services/user-activity';
 import type { ChatInputCommandInteraction } from 'discord.js';
+import { LumiaBotIntegration } from '../services/orchestrator';
+import type { MessageContext } from '../services/orchestrator/types';
 
 export interface Command {
   data: {
@@ -83,6 +85,8 @@ export class DiscordBot {
   public client: Client;
   public commands: Collection<string, Command>;
   private typingIntervals: Map<string, Timer>; // channelId -> timer
+  private orchestrator?: LumiaBotIntegration;
+  private orchestratorQueue: Map<string, { message: Message; replyContext: any }>; // eventId -> message info
 
   constructor() {
     this.client = new Client({
@@ -96,7 +100,179 @@ export class DiscordBot {
 
     this.commands = new Collection();
     this.typingIntervals = new Map();
+    this.orchestratorQueue = new Map();
     this.setupEventHandlers();
+    this.setupOrchestrator();
+  }
+
+  /**
+   * Setup orchestrator integration if enabled
+   */
+  private setupOrchestrator(): void {
+    if (!config.orchestrator.enabled) {
+      console.log('[Orchestrator] Integration disabled');
+      return;
+    }
+
+    console.log('[Orchestrator] Initializing integration...');
+
+    this.orchestrator = new LumiaBotIntegration({
+      orchestratorUrl: config.orchestrator.url,
+      apiKey: config.orchestrator.apiKey,
+      botId: config.orchestrator.botId,
+      botName: config.orchestrator.botName,
+      token: config.discord.token,
+      guilds: [],
+      reconnectIntervalMs: config.orchestrator.reconnectIntervalMs,
+      maxReconnectAttempts: config.orchestrator.maxReconnectAttempts,
+    });
+
+    // Set up response handler for orchestrator
+    this.orchestrator.setResponseHandler(async (context: MessageContext, eventId: string) => {
+      return this.handleOrchestratorResponse(context, eventId);
+    });
+
+    // Set up callback for when orchestrator says we should respond
+    // Note: Response is now sent directly in handleOrchestratorResponse
+    // This callback is kept for compatibility but the actual sending happens in the response handler
+    this.orchestrator.setResponseReadyCallback((eventId: string, response: string) => {
+      console.log(`[Orchestrator] Response ready callback for event ${eventId} (response length: ${response.length})`);
+      // Queue is already cleaned up in handleOrchestratorResponse to prevent race conditions.
+      // This delete is a safe no-op if the entry was already removed.
+      this.orchestratorQueue.delete(eventId);
+    });
+
+    // Set up typing callback for orchestrated responses
+    this.orchestrator.setTypingCallback((channelId: string, guildId: string, isTyping: boolean) => {
+      this.handleOrchestratorTyping(channelId, guildId, isTyping);
+    });
+
+    // Set up onConnect callback to send guilds when connected
+    this.orchestrator.setOnConnect(() => {
+      console.log('[Orchestrator] Connection established, sending guilds...');
+      this.updateOrchestratorGuilds();
+    });
+
+    // Connect to orchestrator
+    this.orchestrator.connect().then(() => {
+      console.log('[Orchestrator] Connected successfully');
+    }).catch((error) => {
+      console.error('[Orchestrator] Failed to connect:', error);
+      console.log('[Orchestrator] Continuing without orchestration...');
+    });
+  }
+
+  /**
+   * Handle orchestrator response request - generates actual response and sends it
+   */
+  private async handleOrchestratorResponse(context: MessageContext, eventId: string): Promise<string> {
+    console.log('[Orchestrator] Generating response for event', {
+      eventId,
+      turnCount: context.turnCount,
+      maxTurns: context.maxTurns,
+      isBanter: context.isBanter,
+    });
+
+    // Look up the original message from the queue and delete immediately
+    // to prevent race conditions if multiple response_requests arrive
+    const queuedInfo = this.orchestratorQueue.get(eventId);
+    if (!queuedInfo) {
+      console.error(`[Orchestrator] No queued message found for event ${eventId}`);
+      return '';
+    }
+    this.orchestratorQueue.delete(eventId);
+
+    const { message, replyContext } = queuedInfo;
+
+    // Get the last message from context
+    const lastMessage = context.previousMessages[context.previousMessages.length - 1];
+    if (!lastMessage) {
+      console.error('[Orchestrator] No last message in context');
+      return '';
+    }
+
+    try {
+      // Build conversation history from context
+      const channelHistory = context.previousMessages
+        .filter(m => m.id !== lastMessage.id) // Exclude the current message
+        .map(m => `${m.isBot ? 'Bot' : 'User'} ${m.authorName}: ${m.content}`)
+        .join('\n');
+
+      // Generate response using the existing message handler
+      const response = await handleMessage({
+        content: lastMessage.content,
+        imageUrls: [], // TODO: Extract from message if needed
+        videoUrls: [],
+        textAttachments: [],
+        userId: lastMessage.authorId,
+        username: lastMessage.authorName,
+        guildId: message.guildId || 'dm',
+        mentionedUsers: new Map(),
+        channelHistory: channelHistory || undefined,
+        getUserListeningActivity: async () => null,
+      });
+
+      // Send the response directly to Discord
+      if (response.text && response.text.trim()) {
+        console.log(`[Orchestrator] Sending response to Discord for event ${eventId}`);
+        await message.reply({
+          content: response.text,
+          failIfNotExists: false,
+        });
+      }
+
+      return response.text;
+    } catch (error) {
+      console.error('[Orchestrator] Failed to generate or send response:', error);
+      return '';
+    }
+  }
+
+  /**
+   * Check if orchestrator is active and should handle this mention
+   */
+  private shouldUseOrchestrator(message: Message): boolean {
+    if (!this.orchestrator?.isConnectedToOrchestrator()) {
+      return false;
+    }
+
+    const botId = this.client.user?.id;
+    if (!botId) return false;
+
+    // Check if multiple bots are @mentioned
+    const mentionedBots = message.mentions.users.filter(user => user.bot);
+
+    // If multiple bots are @mentioned, use orchestrator
+    if (mentionedBots.size > 1) {
+      return true;
+    }
+
+    // Check for trigger keywords
+    const triggerKeywords = extractTriggerKeywords(message.content);
+    const hasTriggerWords = triggerKeywords.length > 0;
+
+    // If this bot is triggered by keywords AND there are other bots in the guild,
+    // use orchestrator to coordinate (in case other bots also have trigger words)
+    if (hasTriggerWords && message.guild) {
+      // Count other bots in the guild (excluding self)
+      const otherBots = message.guild.members.cache.filter(
+        member => member.user.bot && member.user.id !== botId
+      );
+
+      // If there are other bots in the guild, use orchestrator
+      // The orchestrator will determine if they should respond
+      if (otherBots.size > 0) {
+        console.log(`🎭 [Orchestrator] Trigger words detected with ${otherBots.size} other bots in guild, using orchestrator`);
+        return true;
+      }
+    }
+
+    // If it's a reply to a message with bot mentions, use orchestrator
+    if (message.reference && mentionedBots.size > 0) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -149,6 +325,55 @@ export class DiscordBot {
       console.log(`⌨️ [TYPING] Stopped typing indicator in channel ${channelId}`);
     }
     this.typingIntervals.clear();
+  }
+
+  /**
+   * Handle typing indicator for orchestrated responses
+   * Called by the orchestrator when it's this bot's turn to respond
+   */
+  private async handleOrchestratorTyping(channelId: string, guildId: string, isTyping: boolean): Promise<void> {
+    console.log(`⌨️ [Orchestrator-Typing] handleOrchestratorTyping called:`, {
+      channelId,
+      guildId,
+      isTyping,
+      clientReady: this.client.isReady(),
+    });
+    
+    try {
+      if (isTyping) {
+        console.log(`⌨️ [Orchestrator-Typing] Attempting to fetch channel ${channelId}`);
+        
+        // Fetch the channel
+        const channel = await this.client.channels.fetch(channelId);
+        if (!channel) {
+          console.warn(`[Orchestrator-Typing] Channel ${channelId} not found for typing`);
+          return;
+        }
+        
+        console.log(`⌨️ [Orchestrator-Typing] Channel found: ${channel.constructor.name}`);
+
+        // Check if it's a text-based channel
+        if (
+          channel instanceof TextChannel ||
+          channel instanceof ThreadChannel ||
+          channel instanceof NewsChannel ||
+          channel instanceof VoiceChannel ||
+          channel instanceof StageChannel ||
+          channel instanceof DMChannel
+        ) {
+          this.startTyping(channel);
+          console.log(`⌨️ [Orchestrator-Typing] ✅ Started typing in channel ${channelId}`);
+        } else {
+          console.warn(`[Orchestrator-Typing] Channel ${channelId} is not text-based (${channel.constructor.name})`);
+        }
+      } else {
+        // Stop typing
+        this.stopTyping(channelId);
+        console.log(`⌨️ [Orchestrator-Typing] ✅ Stopped typing in channel ${channelId}`);
+      }
+    } catch (error) {
+      console.error(`[Orchestrator-Typing] Failed to handle typing indicator:`, error);
+    }
   }
 
   private setupEventHandlers(): void {
@@ -302,6 +527,12 @@ export class DiscordBot {
       let boredomAction: 'opted-in' | 'opted-out' | undefined;
 
       if (shouldTrigger) {
+        // Check if orchestrator should handle this mention
+        if (this.shouldUseOrchestrator(message)) {
+          await this.handleOrchestratedMention(message, replyContext);
+          return;
+        }
+
         // Check for boredom opt-in/opt-out intent (but let LLM respond naturally)
         if (detectBoredomOptOut(message.content)) {
           const guildId = message.guildId || 'dm';
@@ -588,6 +819,61 @@ export class DiscordBot {
     }
   }
 
+  /**
+   * Handle an orchestrated mention
+   */
+  private async handleOrchestratedMention(
+    message: Message,
+    replyContext: any
+  ): Promise<void> {
+    if (!this.orchestrator) return;
+
+    console.log(`🎭 [Orchestrator] Handling orchestrated mention - NOTIFYING ONLY`);
+
+    const eventId = `evt-${message.id}`;
+    const botId = this.client.user?.id;
+
+    // Get all mentioned bots from the message
+    const mentionedBots = message.mentions.users.filter(user => user.bot);
+    const mentionedBotIds = mentionedBots.map(user => user.id);
+
+    // Add this bot to the list if not already present
+    if (botId && !mentionedBotIds.includes(botId)) {
+      mentionedBotIds.push(botId);
+    }
+
+    // Note: The orchestrator will check its registry to find which bots are registered
+    // We only send bots that are @mentioned or triggered by keywords
+    // The orchestrator handles coordination with registered bots only
+
+    // Extract trigger keywords that matched for this bot
+    const triggerKeywords = extractTriggerKeywords(message.content);
+
+    // Store the message info so we can reply when orchestrator asks us to
+    this.orchestratorQueue!.set(eventId, {
+      message,
+      replyContext,
+    });
+
+    // Notify orchestrator about the mention (fire and forget)
+    this.orchestrator.notifyMention({
+      eventId,
+      messageId: message.id,
+      channelId: message.channelId,
+      guildId: message.guildId || 'dm',
+      authorId: message.author.id,
+      authorName: message.author.username,
+      content: message.content,
+      mentionedBotIds,
+      timestamp: message.createdAt,
+      triggerKeywords: triggerKeywords.length > 0 ? triggerKeywords : undefined,
+    });
+
+    console.log(`🎭 [Orchestrator] Mention notification sent, returning immediately`);
+    // Return immediately - don't wait for orchestrator
+    // The orchestrator will send response_request when it's this bot's turn
+  }
+
   async login(): Promise<void> {
     await this.client.login(config.discord.token);
   }
@@ -595,7 +881,33 @@ export class DiscordBot {
   async destroy(): Promise<void> {
     this.stopAllTyping();
     boredomService.cleanup();
+    if (this.orchestrator) {
+      this.orchestrator.disconnect();
+    }
     await this.client.destroy();
+  }
+
+  /**
+   * Update orchestrator with current guilds (call this after bot is ready)
+   */
+  updateOrchestratorGuilds(): void {
+    if (this.orchestrator) {
+      const guilds = Array.from(this.client.guilds.cache.keys());
+      const status = this.orchestrator.getConnectionStatus();
+      
+      console.log(`[Orchestrator] Updating guilds: ${guilds.length} guilds (connected: ${status.isConnected})`);
+      
+      // Use forceGuildUpdate to ensure it gets sent even if not connected yet
+      this.orchestrator.forceGuildUpdate(guilds);
+    }
+  }
+
+  /**
+   * Get orchestrator connection status
+   */
+  getOrchestratorStatus(): { isConnected: boolean; hasPendingGuildUpdate: boolean; pendingGuildCount: number } | null {
+    if (!this.orchestrator) return null;
+    return this.orchestrator.getConnectionStatus();
   }
 }
 

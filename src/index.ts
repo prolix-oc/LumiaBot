@@ -5,6 +5,7 @@ import { setTemplateVariables } from './services/prompts';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Events } from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -49,6 +50,31 @@ async function main() {
     // Start the bot
     await bot.login();
     console.log('Bot started successfully');
+
+    // Note: Guild updates are now handled by the onConnect callback in the orchestrator
+    // This ensures guilds are sent immediately after the WebSocket connection is established
+
+    // Handle guild join/leave events for orchestrator
+    bot.client.on(Events.GuildCreate, (guild) => {
+      console.log(`[Orchestrator] Joined guild: ${guild.name} (${guild.id})`);
+      bot.updateOrchestratorGuilds();
+    });
+
+    bot.client.on(Events.GuildDelete, (guild) => {
+      console.log(`[Orchestrator] Left guild: ${guild.name} (${guild.id})`);
+      bot.updateOrchestratorGuilds();
+    });
+
+    // Periodic guild sync every 5 minutes to ensure orchestrator has latest data
+    setInterval(() => {
+      if (bot.client.isReady()) {
+        const status = bot.getOrchestratorStatus();
+        if (status?.isConnected) {
+          console.log('[Orchestrator] Periodic guild sync check...');
+          bot.updateOrchestratorGuilds();
+        }
+      }
+    }, 5 * 60 * 1000);
 
     // Handle graceful shutdown
     process.on('SIGINT', async () => {

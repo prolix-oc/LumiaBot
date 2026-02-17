@@ -30,13 +30,13 @@ initializeTriggers();
  */
 export function shouldTriggerBot(content: string, botId: string): boolean {
   const lowerContent = content.toLowerCase().trim();
-  
+
   // Check if bot is mentioned
   const mentionPattern = new RegExp(`<@!?${botId}>`);
   if (mentionPattern.test(content)) {
     return true;
   }
-  
+
   // Check for trigger keywords (only match whole words/phrases)
   for (const keyword of TRIGGER_KEYWORDS) {
     // Escape special regex characters in keyword
@@ -47,8 +47,28 @@ export function shouldTriggerBot(content: string, botId: string): boolean {
       return true;
     }
   }
-  
+
   return false;
+}
+
+/**
+ * Extract all trigger keywords found in the message content
+ * @param content - The message content
+ * @returns Array of matched trigger keywords
+ */
+export function extractTriggerKeywords(content: string): string[] {
+  const lowerContent = content.toLowerCase().trim();
+  const matched: string[] = [];
+
+  for (const keyword of TRIGGER_KEYWORDS) {
+    const escapedKeyword = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`\\b${escapedKeyword}\\b`, 'i');
+    if (pattern.test(lowerContent)) {
+      matched.push(keyword);
+    }
+  }
+
+  return matched;
 }
 
 /**
