@@ -1,7 +1,8 @@
-import { getAIService } from './google-genai';
+import { getAIService, getVisionService } from './google-genai';
 import { parseMessage, storeParsedInformation } from './message-parser';
 import { conversationHistoryService } from './conversation-history';
 import { getTriggerKeywords, getErrorMessage } from './prompts';
+import { config } from '../utils/config';
 import type { MusicActivity } from './user-activity';
 
 // Keywords that trigger the bot (case insensitive)
@@ -203,6 +204,62 @@ function extractReactions(response: string): { text: string; reactions: string[]
 }
 
 /**
+ * Process vision content (images/videos) using a secondary vision model
+ * Returns a description that can be fed into the main text model
+ */
+async function processVisionContent(
+  content: string,
+  imageUrls?: string[],
+  videoUrls?: { url: string; mimeType?: string }[]
+): Promise<string> {
+  if (!config.vision.enabled) {
+    return content;
+  }
+  
+  const hasImages = imageUrls && imageUrls.length > 0;
+  const hasVideos = videoUrls && videoUrls.length > 0;
+  
+  if (!hasImages && !hasVideos) {
+    return content;
+  }
+  
+  console.log(`👁️  [Vision] Processing ${hasImages ? imageUrls!.length : 0} image(s) and ${hasVideos ? videoUrls!.length : 0} video(s) with secondary model...`);
+  
+  try {
+    const visionService = getVisionService();
+    const visionPrompt = `${config.vision.promptPrefix}\n\nUser message: "${content}"`;
+    
+    // Create a minimal conversation for vision processing
+    const visionMessages = [
+      {
+        role: 'user' as const,
+        content: visionPrompt,
+      },
+    ];
+    
+    const visionDescription = await visionService.createChatCompletion({
+      messages: visionMessages,
+      images: imageUrls,
+      videos: videoUrls,
+      maxTokens: config.vision.maxTokens,
+      temperature: config.vision.temperature,
+    });
+    
+    console.log(`👁️  [Vision] Description received (${visionDescription.length} chars)`);
+    
+    // Combine the original content with the vision description
+    const combinedContent = `[Vision Analysis]: ${visionDescription}\n\n[Original User Message]: ${content}`;
+    
+    return combinedContent;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error(`❌ [Vision] Failed to process vision content: ${errorMessage}`);
+    // Fall back to original content if vision processing fails
+    return content;
+  }
+}
+
+/**
  * Handle a message that triggered the bot
  * @param options - Message handling options
  * @returns The bot's response with potential reactions
@@ -258,9 +315,26 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       console.log(`💭 [HANDLER] User context: ${username} (${userId})`);
     }
 
-    // Add user message to conversation history
+    // Determine if this is a vision request
+    const hasImages = imageUrls && imageUrls.length > 0;
+    const hasVideos = videoUrls && videoUrls.length > 0;
+    const isVisionRequest = hasImages || hasVideos;
+    
+    // Process vision content if secondary model is configured
+    let processedContent = content;
+    let processedImages = imageUrls;
+    let processedVideos = videoUrls;
+    
+    if (isVisionRequest && config.vision.enabled) {
+      processedContent = await processVisionContent(content, imageUrls, videoUrls);
+      // Don't pass images/videos to main model since vision model already processed them
+      processedImages = undefined;
+      processedVideos = undefined;
+    }
+
+    // Add user message to conversation history (use processed content if vision was used)
     if (userId && username) {
-      conversationHistoryService.addMessage(userId, guildId, username, 'user', content);
+      conversationHistoryService.addMessage(userId, guildId, username, 'user', processedContent);
     }
 
     // Get conversation history for context
@@ -273,9 +347,9 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       messages: conversationHistory,
       enableSearch: shouldSearch,
       enableKnowledgeGraph: shouldQueryKnowledge,
-      knowledgeQuery: content, // Use the message content as the knowledge query
-      images: imageUrls,
-      videos: videoUrls,
+      knowledgeQuery: processedContent, // Use processed content for knowledge query
+      images: processedImages, // Only pass images if not using vision secondary model
+      videos: processedVideos, // Only pass videos if not using vision secondary model
       textAttachments,
       userId,
       username,

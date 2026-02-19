@@ -106,28 +106,37 @@ export class GoogleGenAIService {
   private defaultTopP: number;
   private defaultTopK: number;
 
-  constructor() {
+  constructor(options?: {
+    apiKey?: string;
+    baseUrl?: string;
+    model?: string;
+    maxTokens?: number;
+    temperature?: number;
+    topP?: number;
+    topK?: number;
+  }) {
     const clientConfig: {
       apiKey: string;
       httpOptions?: { baseUrl?: string };
     } = {
-      apiKey: config.gemini.apiKey!,
+      apiKey: options?.apiKey ?? config.gemini.apiKey!,
     };
 
-    if (config.gemini.baseUrl) {
-      clientConfig.httpOptions = { baseUrl: config.gemini.baseUrl };
+    const baseUrl = options?.baseUrl ?? config.gemini.baseUrl;
+    if (baseUrl) {
+      clientConfig.httpOptions = { baseUrl };
     }
 
     this.client = new GoogleGenAI(clientConfig);
-    this.model = config.openai.modelAlias || config.openai.model;
-    this.defaultMaxTokens = config.openai.maxTokens;
-    this.defaultTemperature = config.openai.temperature;
-    this.defaultTopP = config.openai.topP;
-    this.defaultTopK = config.openai.topK;
+    this.model = options?.model ?? config.openai.modelAlias ?? config.openai.model;
+    this.defaultMaxTokens = options?.maxTokens ?? config.openai.maxTokens;
+    this.defaultTemperature = options?.temperature ?? config.openai.temperature;
+    this.defaultTopP = options?.topP ?? config.openai.topP;
+    this.defaultTopK = options?.topK ?? config.openai.topK;
 
     console.log(`🔮 [Google GenAI] Initialized with model: ${this.model}`);
-    if (config.gemini.baseUrl) {
-      console.log(`🔮 [Google GenAI] Using custom base URL: ${config.gemini.baseUrl}`);
+    if (baseUrl) {
+      console.log(`🔮 [Google GenAI] Using custom base URL: ${baseUrl}`);
     }
   }
 
@@ -1496,3 +1505,42 @@ export function getAIService() {
 export const googleGenaiService = config.gemini.enabled && config.gemini.apiKey 
   ? new GoogleGenAIService() 
   : null;
+
+/**
+ * Factory function to get a vision-specific AI service
+ * Returns a service configured for the VISION_SECONDARY_MODEL if set
+ * Used to process images/videos separately from the main model
+ */
+export function getVisionService() {
+  const { vision, gemini } = config;
+  
+  if (!vision.enabled) {
+    // Fall back to default behavior if vision secondary model is not configured
+    return getAIService();
+  }
+  
+  const visionModel = vision.model.toLowerCase();
+  const isGeminiVision = visionModel.includes('gemini-3') || visionModel.includes('gemini3');
+  
+  if (isGeminiVision && vision.provider === 'gemini') {
+    console.log(`👁️  [Vision Service] Using Google GenAI for vision: ${vision.model}`);
+    return new GoogleGenAIService({
+      apiKey: vision.apiKey,
+      baseUrl: vision.baseUrl,
+      model: vision.model,
+      maxTokens: vision.maxTokens,
+      temperature: vision.temperature,
+    });
+  }
+  
+  // Default to OpenAI for vision (handles gpt-4o, gpt-4o-mini, etc.)
+  console.log(`👁️  [Vision Service] Using OpenAI for vision: ${vision.model}`);
+  const { OpenAIService } = require('./openai');
+  return new OpenAIService({
+    apiKey: vision.apiKey,
+    baseUrl: vision.baseUrl,
+    model: vision.model,
+    maxTokens: vision.maxTokens,
+    temperature: vision.temperature,
+  });
+}

@@ -86,7 +86,7 @@ export class DiscordBot {
   public commands: Collection<string, Command>;
   private typingIntervals: Map<string, Timer>; // channelId -> timer
   private orchestrator?: LumiaBotIntegration;
-  private orchestratorQueue: Map<string, { message: Message; replyContext: any }>; // eventId -> message info
+  private orchestratorQueue: Map<string, { message: Message; replyContext: any; imageUrls: string[]; videoUrls: { url: string; mimeType?: string }[]; textAttachments: { name: string; content: string }[] }>; // eventId -> message info
 
   constructor() {
     this.client = new Client({
@@ -194,7 +194,7 @@ export class DiscordBot {
       return '';
     }
 
-    const { message, replyContext } = queuedInfo;
+    const { message, replyContext, imageUrls, videoUrls, textAttachments } = queuedInfo;
 
     // Get the last message from context
     const lastMessage = context.previousMessages[context.previousMessages.length - 1];
@@ -265,13 +265,18 @@ export class DiscordBot {
       // Generate response using the existing message handler
       const response = await handleMessage({
         content: lastMessage.content,
-        imageUrls: [], // TODO: Extract from message if needed
-        videoUrls: [],
-        textAttachments: [],
+        imageUrls,
+        videoUrls,
+        textAttachments,
         userId: lastMessage.authorId,
         username: lastMessage.authorName,
         guildId: message.guildId || 'dm',
         mentionedUsers,
+        replyContext: replyContext ? {
+          isReply: replyContext.isReply,
+          originalContent: replyContext.originalContent,
+          originalTimestamp: replyContext.originalTimestamp,
+        } : undefined,
         channelHistory: channelHistory || undefined,
         getUserListeningActivity,
         // Orchestrator follow-up support: allow the LLM to request another turn
@@ -918,10 +923,81 @@ export class DiscordBot {
     // Extract trigger keywords that matched for this bot
     const triggerKeywords = extractTriggerKeywords(message.content);
 
-    // Store the message info so we can reply when orchestrator asks us to
+    // Extract modal content (images, videos, text files) from the message
+    const imageUrls: string[] = [];
+    const videoUrls: { url: string; mimeType?: string }[] = [];
+    const textAttachments: { name: string; content: string }[] = [];
+
+    if (message.attachments.size > 0) {
+      for (const attachment of message.attachments.values()) {
+        if (attachment.contentType?.startsWith('image/gif')) {
+          videoUrls.push({
+            url: attachment.url,
+            mimeType: attachment.contentType,
+          });
+          console.log(`🎬 [Orchestrator] GIF found in message (will convert to WebM): ${attachment.name} (${attachment.contentType})`);
+        } else if (attachment.contentType?.startsWith('image/')) {
+          imageUrls.push(attachment.url);
+          console.log(`🖼️  [Orchestrator] Image found in message: ${attachment.name} (${attachment.contentType})`);
+        } else if (attachment.contentType?.startsWith('video/')) {
+          videoUrls.push({
+            url: attachment.url,
+            mimeType: attachment.contentType,
+          });
+          console.log(`🎥 [Orchestrator] Video found in message: ${attachment.name} (${attachment.contentType})`);
+        } else if (attachment.contentType?.startsWith('text/') || 
+                  attachment.name.match(/\.(txt|md|json|csv|log|xml|yaml|yml|js|ts|jsx|tsx|py|rb|java|c|cpp|h|hpp|cs|go|rs|php|html|css|scss|sass|less|sql)$/i)) {
+          // Text file detected - check size and read content
+          const maxSizeBytes = config.attachments.maxTextFileSizeKB * 1024;
+          
+          // Check file size before downloading
+          if (attachment.size > maxSizeBytes) {
+            console.log(`📄 [Orchestrator] Text file too large: ${attachment.name} (${(attachment.size / 1024).toFixed(1)}KB > ${config.attachments.maxTextFileSizeKB}KB limit)`);
+            textAttachments.push({
+              name: attachment.name,
+              content: `[File too large: ${(attachment.size / 1024).toFixed(1)}KB. Maximum size is ${config.attachments.maxTextFileSizeKB}KB]`,
+            });
+            continue;
+          }
+          
+          try {
+            console.log(`📄 [Orchestrator] Text file detected: ${attachment.name} (${attachment.contentType || 'unknown type'}, ${(attachment.size / 1024).toFixed(1)}KB)`);
+            const response = await fetch(attachment.url);
+            if (response.ok) {
+              const textContent = await response.text();
+              // Limit text content to prevent token overflow
+              const maxChars = maxSizeBytes;
+              const truncatedContent = textContent.length > maxChars 
+                ? textContent.substring(0, maxChars) + '\n... [content truncated]' 
+                : textContent;
+              textAttachments.push({
+                name: attachment.name,
+                content: truncatedContent,
+              });
+              console.log(`📄 [Orchestrator] Read text file: ${attachment.name} (${truncatedContent.length} chars)`);
+            } else {
+              console.warn(`⚠️ [Orchestrator] Failed to fetch text file ${attachment.name}: ${response.status}`);
+            }
+          } catch (error) {
+            console.error(`❌ [Orchestrator] Error reading text file ${attachment.name}:`, error);
+          }
+        }
+      }
+    }
+
+    // Add embedded content from reply context
+    if (replyContext?.embeddedContent) {
+      imageUrls.push(...replyContext.embeddedContent.images);
+      videoUrls.push(...replyContext.embeddedContent.videos);
+    }
+
+    // Store the message info and modal content so we can reply when orchestrator asks us to
     this.orchestratorQueue!.set(eventId, {
       message,
       replyContext,
+      imageUrls,
+      videoUrls,
+      textAttachments,
     });
 
     // Notify orchestrator about the mention (fire and forget)

@@ -103,23 +103,36 @@ export class OpenAIService {
   private defaultTopP: number;
   private defaultTopK: number;
   private filterReasoning: boolean;
+  private extraBody?: Record<string, unknown>;
 
-  constructor() {
+  constructor(options?: {
+    apiKey?: string;
+    baseUrl?: string;
+    model?: string;
+    maxTokens?: number;
+    temperature?: number;
+    topP?: number;
+    topK?: number;
+    filterReasoning?: boolean;
+    extraBody?: Record<string, unknown>;
+  }) {
     const clientConfig: { apiKey: string; baseURL?: string } = {
-      apiKey: config.openai.apiKey,
+      apiKey: options?.apiKey ?? config.openai.apiKey,
     };
     
-    if (config.openai.baseUrl) {
-      clientConfig.baseURL = config.openai.baseUrl;
+    const baseUrl = options?.baseUrl ?? config.openai.baseUrl;
+    if (baseUrl) {
+      clientConfig.baseURL = baseUrl;
     }
     
     this.client = new OpenAI(clientConfig);
-    this.model = config.openai.modelAlias || config.openai.model;
-    this.defaultMaxTokens = config.openai.maxTokens;
-    this.defaultTemperature = config.openai.temperature;
-    this.defaultTopP = config.openai.topP;
-    this.defaultTopK = config.openai.topK;
-    this.filterReasoning = config.openai.filterReasoning;
+    this.model = options?.model ?? config.openai.modelAlias ?? config.openai.model;
+    this.defaultMaxTokens = options?.maxTokens ?? config.openai.maxTokens;
+    this.defaultTemperature = options?.temperature ?? config.openai.temperature;
+    this.defaultTopP = options?.topP ?? config.openai.topP;
+    this.defaultTopK = options?.topK ?? config.openai.topK;
+    this.filterReasoning = options?.filterReasoning ?? config.openai.filterReasoning;
+    this.extraBody = options?.extraBody ?? config.openai.extraBody;
   }
 
   /**
@@ -303,6 +316,11 @@ export class OpenAIService {
           requestParams.thinking_config = {
             thinking_level: 'MINIMAL' // MINIMAL, LOW, MEDIUM, HIGH
           };
+        }
+
+        // Add extra_body if configured (for custom provider parameters)
+        if (this.extraBody) {
+          requestParams.extra_body = this.extraBody;
         }
 
         const completion = await this.client.chat.completions.create(requestParams);
@@ -1479,8 +1497,14 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             };
           }
 
+          // Add extra_body if configured (for custom provider parameters)
+          if (this.extraBody) {
+            runToolsParams.extra_body = this.extraBody;
+          }
+
           // Use runTools to automatically handle the function calling loop
-          const runner = (this.client as any).chat.completions.runTools(runToolsParams);
+          // Note: runTools is available in the beta namespace of the OpenAI SDK
+          const runner = this.client.beta.chat.completions.runTools(runToolsParams);
 
           // Get the final response
           const finalCompletion = await runner.finalChatCompletion();
@@ -1632,6 +1656,11 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
         streamParams.thinking_config = {
           thinking_level: 'MINIMAL' // MINIMAL, LOW, MEDIUM, HIGH
         };
+      }
+
+      // Add extra_body if configured (for custom provider parameters)
+      if (this.extraBody) {
+        streamParams.extra_body = this.extraBody;
       }
 
       const stream = await this.client.chat.completions.create(streamParams as OpenAI.ChatCompletionCreateParamsStreaming);

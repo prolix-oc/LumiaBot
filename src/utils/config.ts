@@ -21,11 +21,29 @@ export const config = {
     topP: process.env.OPENAI_TOP_P ? parseFloat(process.env.OPENAI_TOP_P) : 0.95,
     topK: process.env.OPENAI_TOP_K ? parseInt(process.env.OPENAI_TOP_K) : 0,
     filterReasoning: process.env.OPENAI_FILTER_REASONING !== 'false',
+    extraBody: (() => {
+      try {
+        return process.env.OPENAI_EXTRA_BODY ? JSON.parse(process.env.OPENAI_EXTRA_BODY) : undefined;
+      } catch (e) {
+        console.warn('⚠️ [Config] Failed to parse OPENAI_EXTRA_BODY as JSON, ignoring');
+        return undefined;
+      }
+    })(),
   },
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || undefined,
     baseUrl: process.env.GEMINI_BASE_URL || undefined,
     enabled: !!process.env.GEMINI_API_KEY,
+  },
+  vision: {
+    enabled: !!process.env.VISION_SECONDARY_MODEL,
+    model: process.env.VISION_SECONDARY_MODEL || '',
+    provider: (process.env.VISION_SECONDARY_PROVIDER || 'openai') as 'openai' | 'gemini',
+    apiKey: process.env.VISION_SECONDARY_API_KEY || process.env.OPENAI_API_KEY!,
+    baseUrl: process.env.VISION_SECONDARY_BASE_URL || process.env.OPENAI_BASE_URL,
+    maxTokens: parseInt(process.env.VISION_SECONDARY_MAX_TOKENS || '2000'),
+    temperature: parseFloat(process.env.VISION_SECONDARY_TEMPERATURE || '1'),
+    promptPrefix: process.env.VISION_SECONDARY_PROMPT_PREFIX || 'Describe what you see in this image in detail:',
   },
   searxng: {
     baseUrl: process.env.SEARXNG_URL || 'https://search.example.com',
