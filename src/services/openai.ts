@@ -77,13 +77,16 @@ export interface ChatCompletionOptions {
   images?: string[]; // URLs of images to include with the last user message
   videos?: { url: string; mimeType?: string }[]; // URLs of videos to include (Gemini 3 only)
   textAttachments?: { name: string; content: string }[]; // Text file attachments
+  pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
   userId?: string; // Discord user ID for memory
   username?: string; // Discord username for memory
   guildId?: string; // Discord guild ID for guild-specific context
-  replyContext?: { // Context when user is replying to Lumia's message
+  replyContext?: { // Context when user is replying to a message
     isReply: boolean;
+    isReplyToLumia?: boolean;
     originalContent?: string;
     originalTimestamp?: string;
+    originalAuthor?: string;
   };
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
   enableMusicTaste?: boolean; // DEPRECATED: Auto-inject music context (default: false). Use get_music_taste tool instead
@@ -465,7 +468,8 @@ export class OpenAIService {
     lastMessageContent?: string,
     channelHistory?: string,
     textAttachments?: { name: string; content: string }[],
-    mentionedUsers?: Map<string, string>
+    mentionedUsers?: Map<string, string>,
+    pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]
   ): string {
     const botDefinition = getBotDefinition();
     
@@ -565,7 +569,17 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
         systemPrompt += `\n--- File: ${attachment.name} ---\n${attachment.content}\n--- End of ${attachment.name} ---\n`;
       }
     }
-    
+
+    // Add extracted web page contents if present
+    if (pageContents && pageContents.length > 0) {
+      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
+║  🌐 EXTRACTED WEB PAGES                                        ║
+╚════════════════════════════════════════════════════════════════╝\n`;
+      for (const page of pageContents) {
+        systemPrompt += `\n--- Page: ${page.title} (${page.url}) ---\n${page.content}\n--- End of page ---\n`;
+      }
+    }
+
     // Add guild-specific context if available
     if (guildId) {
       const insideJokesContext = guildMemoryService.getInsideJokesContext(guildId);
@@ -573,7 +587,7 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
         systemPrompt += `\n\n${insideJokesContext}`;
       }
     }
-    
+
     // Add knowledge graph context if available
     if (knowledgeContext) {
       systemPrompt += `\n\n${knowledgeContext}`;
@@ -714,14 +728,14 @@ The following are your past thoughts about ${username || 'this user'}. Use these
   }
 
   async createChatCompletion(options: ChatCompletionOptions): Promise<string> {
-    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, channelHistory, mentionedUsers } = options;
+    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, channelHistory, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
     const hasImages = images && images.length > 0;
     const hasVideos = videos && videos.length > 0;
     const isGemini = isGemini3Model();
-    
+
     if (isMultimodal) {
       const parts: string[] = [];
       if (hasImages) parts.push(`${images!.length} image(s)`);
@@ -747,7 +761,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
 
     // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers);
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers, pageContents);
 
     // Process videos for models that support inline base64 video (Gemini 3 or OPENAI_VIDEO_ENABLED)
     let processedVideos: { uri: string; mimeType: string; inlineData: boolean }[] = [];
@@ -1617,7 +1631,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
   }
 
   async *streamChatCompletion(options: ChatCompletionOptions): AsyncGenerator<string> {
-    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, channelHistory, mentionedUsers } = options;
+    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, channelHistory, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -1658,7 +1672,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
 
     // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers);
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers, pageContents);
 
     // Pre-response persona directive — prepended to last user message
     const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';

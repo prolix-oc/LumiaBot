@@ -72,13 +72,16 @@ export interface ChatCompletionOptions {
   images?: string[]; // URLs of images to include with the last user message
   videos?: { url: string; mimeType?: string }[]; // URLs of videos to include (Gemini 3 only)
   textAttachments?: { name: string; content: string }[]; // Text file attachments
+  pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
   userId?: string;
   username?: string;
   guildId?: string;
   replyContext?: {
     isReply: boolean;
+    isReplyToLumia?: boolean;
     originalContent?: string;
     originalTimestamp?: string;
+    originalAuthor?: string;
   };
   boredomAction?: 'opted-in' | 'opted-out';
   enableMusicTaste?: boolean;
@@ -287,7 +290,7 @@ export class GoogleGenAIService {
     hasVideos: boolean,
     knowledgeContext?: string
   ): string {
-    const { userId, username, guildId, replyContext, boredomAction, channelHistory, enableMusicTaste, textAttachments, mentionedUsers } = options;
+    const { userId, username, guildId, replyContext, boredomAction, channelHistory, enableMusicTaste, textAttachments, pageContents, mentionedUsers } = options;
     
     // Add current date/time context at the very beginning
     const now = new Date();
@@ -388,7 +391,17 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
         systemPrompt += `\n--- File: ${attachment.name} ---\n${attachment.content}\n--- End of ${attachment.name} ---\n`;
       }
     }
-    
+
+    // Add extracted web page contents if present
+    if (pageContents && pageContents.length > 0) {
+      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
+║  🌐 EXTRACTED WEB PAGES                                        ║
+╚════════════════════════════════════════════════════════════════╝\n`;
+      for (const page of pageContents) {
+        systemPrompt += `\n--- Page: ${page.title} (${page.url}) ---\n${page.content}\n--- End of page ---\n`;
+      }
+    }
+
     // Add guild-specific context if available
     if (guildId) {
       const insideJokesContext = guildMemoryService.getInsideJokesContext(guildId);
@@ -396,7 +409,7 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
         systemPrompt += `\n\n${insideJokesContext}`;
       }
     }
-    
+
     // Add knowledge graph context if available
     if (knowledgeContext) {
       systemPrompt += `\n\n${knowledgeContext}`;
@@ -500,13 +513,23 @@ The following are your past thoughts about ${username || 'this user'}. Use these
   /**
    * Build the reply context prompt with strong emphasis
    */
-  private buildReplyContextPrompt(replyContext: { isReply: boolean; originalContent?: string; originalTimestamp?: string }): string {
-    // For Google GenAI, we simplify the reply context
+  private buildReplyContextPrompt(replyContext: { isReply: boolean; isReplyToLumia?: boolean; originalContent?: string; originalTimestamp?: string; originalAuthor?: string }): string {
+    const isReplyToLumia = replyContext.isReplyToLumia !== false; // Default to true for backward compatibility
+    const authorName = replyContext.originalAuthor || 'Unknown';
     const timestampText = replyContext.originalTimestamp ? `\n[Sent ${replyContext.originalTimestamp}]` : '';
-    
-    return `\n\n## Reply Context
 
-The user is replying to your previous message:\n${replyContext.originalContent || ''}${timestampText}\n\nRespond directly to their reply, referencing your previous message when relevant.`;
+    if (isReplyToLumia) {
+      return getReplyContextTemplate('reply_to_bot', {
+        originalContent: replyContext.originalContent || '',
+        timestamp: timestampText
+      });
+    } else {
+      return getReplyContextTemplate('reply_to_other', {
+        authorName: authorName,
+        originalContent: replyContext.originalContent || '',
+        timestamp: timestampText
+      });
+    }
   }
 
   /**

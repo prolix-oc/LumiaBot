@@ -5,6 +5,7 @@ import { boredomService, getRandomBoredomMessage } from '../services/boredom';
 import { channelHistoryService } from '../services/channel-history';
 import { getErrorMessage } from '../services/prompts';
 import { userActivityService } from '../services/user-activity';
+import { pageExtractorService } from '../services/page-extractor';
 import type { ChatInputCommandInteraction } from 'discord.js';
 import { LumiaBotIntegration } from '../services/orchestrator';
 import type { MessageContext } from '../services/orchestrator/types';
@@ -262,20 +263,28 @@ export class DiscordBot {
         }
       };
 
+      // Extract web page content from URLs in orchestrator message
+      const orchestratorPageContents = config.pageExtraction.enabled
+        ? await pageExtractorService.extractPagesFromMessage(lastMessage.content)
+        : [];
+
       // Generate response using the existing message handler
       const response = await handleMessage({
         content: lastMessage.content,
         imageUrls,
         videoUrls,
         textAttachments,
+        pageContents: orchestratorPageContents.length > 0 ? orchestratorPageContents : undefined,
         userId: lastMessage.authorId,
         username: lastMessage.authorName,
         guildId: message.guildId || 'dm',
         mentionedUsers,
         replyContext: replyContext ? {
           isReply: replyContext.isReply,
+          isReplyToLumia: replyContext.isReplyToLumia,
           originalContent: replyContext.originalContent,
           originalTimestamp: replyContext.originalTimestamp,
+          originalAuthor: replyContext.originalAuthor,
         } : undefined,
         channelHistory: channelHistory || undefined,
         getUserListeningActivity,
@@ -546,6 +555,7 @@ export class DiscordBot {
           const embeddedImages: string[] = [];
           const embeddedVideos: { url: string; mimeType?: string }[] = [];
           
+          // Extract attachments from referenced message
           if (referencedMessage.attachments.size > 0) {
             referencedMessage.attachments.forEach((attachment) => {
               if (attachment.contentType?.startsWith('image/gif')) {
@@ -553,18 +563,58 @@ export class DiscordBot {
                   url: attachment.url,
                   mimeType: attachment.contentType,
                 });
-                console.log(`🎬 [CLIENT] Referenced GIF: ${attachment.name}`);
+                console.log(`🎬 [CLIENT] Referenced GIF attachment: ${attachment.name}`);
               } else if (attachment.contentType?.startsWith('image/')) {
                 embeddedImages.push(attachment.url);
-                console.log(`🖼️  [CLIENT] Referenced image: ${attachment.name}`);
+                console.log(`🖼️  [CLIENT] Referenced image attachment: ${attachment.name}`);
               } else if (attachment.contentType?.startsWith('video/')) {
                 embeddedVideos.push({
                   url: attachment.url,
                   mimeType: attachment.contentType,
                 });
-                console.log(`🎥 [CLIENT] Referenced video: ${attachment.name}`);
+                console.log(`🎥 [CLIENT] Referenced video attachment: ${attachment.name}`);
               }
             });
+          }
+
+          // Extract embeds from referenced message (Tenor GIFs, link previews, video embeds, etc.)
+          if (referencedMessage.embeds.length > 0) {
+            for (const embed of referencedMessage.embeds) {
+              const embedType = embed.data?.type;
+
+              // GIFV embeds (Tenor, Giphy, etc.)
+              if (embedType === 'gifv' && embed.video?.url) {
+                embeddedVideos.push({
+                  url: embed.video.url,
+                  mimeType: 'image/gif',
+                });
+                console.log(`🎬 [CLIENT] Referenced GIFV embed: ${embed.url || embed.video.url}`);
+              }
+              // Video embeds (YouTube, etc.)
+              else if (embedType === 'video' && embed.video?.url) {
+                embeddedVideos.push({
+                  url: embed.video.proxyURL || embed.video.url,
+                  mimeType: 'video/mp4',
+                });
+                console.log(`🎥 [CLIENT] Referenced video embed: ${embed.url || embed.video.url}`);
+              }
+              // Image embeds
+              else if (embedType === 'image' && embed.image?.url) {
+                embeddedImages.push(embed.image.proxyURL || embed.image.url);
+                console.log(`🖼️  [CLIENT] Referenced image embed: ${embed.image.url}`);
+              }
+              // Rich embeds with images or thumbnails (link previews, etc.)
+              else if (embedType === 'rich' || embedType === 'article' || embedType === 'link') {
+                if (embed.image?.url) {
+                  embeddedImages.push(embed.image.proxyURL || embed.image.url);
+                  console.log(`🖼️  [CLIENT] Referenced rich embed image: ${embed.image.url}`);
+                }
+                if (embed.thumbnail?.url) {
+                  embeddedImages.push(embed.thumbnail.proxyURL || embed.thumbnail.url);
+                  console.log(`🖼️  [CLIENT] Referenced rich embed thumbnail: ${embed.thumbnail.url}`);
+                }
+              }
+            }
           }
           
           replyContext = {
@@ -712,6 +762,33 @@ export class DiscordBot {
             }
           }
 
+          // Extract embeds from current message (forwarded messages, etc.)
+          if (message.embeds.length > 0) {
+            for (const embed of message.embeds) {
+              const embedType = embed.data?.type;
+
+              if (embedType === 'gifv' && embed.video?.url) {
+                videoUrls.push({ url: embed.video.url, mimeType: 'image/gif' });
+                console.log(`🎬 [CLIENT] GIFV embed in message: ${embed.url || embed.video.url}`);
+              } else if (embedType === 'video' && embed.video?.url) {
+                videoUrls.push({ url: embed.video.proxyURL || embed.video.url, mimeType: 'video/mp4' });
+                console.log(`🎥 [CLIENT] Video embed in message: ${embed.url || embed.video.url}`);
+              } else if (embedType === 'image' && embed.image?.url) {
+                imageUrls.push(embed.image.proxyURL || embed.image.url);
+                console.log(`🖼️  [CLIENT] Image embed in message: ${embed.image.url}`);
+              } else if (embedType === 'rich' || embedType === 'article' || embedType === 'link') {
+                if (embed.image?.url) {
+                  imageUrls.push(embed.image.proxyURL || embed.image.url);
+                  console.log(`🖼️  [CLIENT] Rich embed image in message: ${embed.image.url}`);
+                }
+                if (embed.thumbnail?.url) {
+                  imageUrls.push(embed.thumbnail.proxyURL || embed.thumbnail.url);
+                  console.log(`🖼️  [CLIENT] Rich embed thumbnail in message: ${embed.thumbnail.url}`);
+                }
+              }
+            }
+          }
+
           // Add embedded content from reply context
           if (replyContext?.embeddedContent) {
             imageUrls.push(...replyContext.embeddedContent.images);
@@ -767,20 +844,28 @@ export class DiscordBot {
             }
           };
 
+          // Extract web page content from URLs in message
+          const pageContents = config.pageExtraction.enabled
+            ? await pageExtractorService.extractPagesFromMessage(cleanedContent)
+            : [];
+
           // Generate response (search intent detected automatically via heuristics)
           const response = await handleMessage({
             content: cleanedContent,
             imageUrls,
             videoUrls,
             textAttachments,
+            pageContents: pageContents.length > 0 ? pageContents : undefined,
             userId: message.author.id,
             username: message.author.username,
             guildId: message.guildId || 'dm',
             mentionedUsers,
             replyContext: replyContext ? {
               isReply: replyContext.isReply,
+              isReplyToLumia: replyContext.isReplyToLumia,
               originalContent: replyContext.originalContent,
               originalTimestamp: replyContext.originalTimestamp,
+              originalAuthor: replyContext.originalAuthor,
             } : undefined,
             boredomAction,
             channelHistory,
@@ -980,6 +1065,33 @@ export class DiscordBot {
             }
           } catch (error) {
             console.error(`❌ [Orchestrator] Error reading text file ${attachment.name}:`, error);
+          }
+        }
+      }
+    }
+
+    // Extract embeds from current message (Tenor GIFs, link previews, etc.)
+    if (message.embeds.length > 0) {
+      for (const embed of message.embeds) {
+        const embedType = embed.data?.type;
+
+        if (embedType === 'gifv' && embed.video?.url) {
+          videoUrls.push({ url: embed.video.url, mimeType: 'image/gif' });
+          console.log(`🎬 [Orchestrator] GIFV embed in message: ${embed.url || embed.video.url}`);
+        } else if (embedType === 'video' && embed.video?.url) {
+          videoUrls.push({ url: embed.video.proxyURL || embed.video.url, mimeType: 'video/mp4' });
+          console.log(`🎥 [Orchestrator] Video embed in message: ${embed.url || embed.video.url}`);
+        } else if (embedType === 'image' && embed.image?.url) {
+          imageUrls.push(embed.image.proxyURL || embed.image.url);
+          console.log(`🖼️  [Orchestrator] Image embed in message: ${embed.image.url}`);
+        } else if (embedType === 'rich' || embedType === 'article' || embedType === 'link') {
+          if (embed.image?.url) {
+            imageUrls.push(embed.image.proxyURL || embed.image.url);
+            console.log(`🖼️  [Orchestrator] Rich embed image in message: ${embed.image.url}`);
+          }
+          if (embed.thumbnail?.url) {
+            imageUrls.push(embed.thumbnail.proxyURL || embed.thumbnail.url);
+            console.log(`🖼️  [Orchestrator] Rich embed thumbnail in message: ${embed.thumbnail.url}`);
           }
         }
       }

@@ -23,6 +23,18 @@ function initializeTriggers(): void {
 initializeTriggers();
 
 /**
+ * Strip URLs from text so that words inside links don't trigger the bot.
+ * Removes both bare URLs (https://...) and markdown links ([text](url)).
+ */
+function stripUrls(text: string): string {
+  // Remove markdown links entirely: [link text](url)
+  let stripped = text.replace(/\[([^\]]*)\]\(https?:\/\/[^\s)]+\)/gi, '$1');
+  // Remove bare URLs
+  stripped = stripped.replace(/https?:\/\/[^\s<>"'\)\]]+/gi, '');
+  return stripped;
+}
+
+/**
  * Check if a message should trigger the bot response
  * @param content - The message content
  * @param botId - The bot's user ID
@@ -30,13 +42,14 @@ initializeTriggers();
  * @returns boolean indicating if bot should respond
  */
 export function shouldTriggerBot(content: string, botId: string): boolean {
-  const lowerContent = content.toLowerCase().trim();
-
-  // Check if bot is mentioned
+  // Check if bot is mentioned (against original content, before URL stripping)
   const mentionPattern = new RegExp(`<@!?${botId}>`);
   if (mentionPattern.test(content)) {
     return true;
   }
+
+  // Strip URLs so trigger words inside links don't activate the bot
+  const lowerContent = stripUrls(content).toLowerCase().trim();
 
   // Check for trigger keywords (only match whole words/phrases)
   for (const keyword of TRIGGER_KEYWORDS) {
@@ -58,7 +71,8 @@ export function shouldTriggerBot(content: string, botId: string): boolean {
  * @returns Array of matched trigger keywords
  */
 export function extractTriggerKeywords(content: string): string[] {
-  const lowerContent = content.toLowerCase().trim();
+  // Strip URLs so trigger words inside links are ignored
+  const lowerContent = stripUrls(content).toLowerCase().trim();
   const matched: string[] = [];
 
   for (const keyword of TRIGGER_KEYWORDS) {
@@ -152,14 +166,17 @@ export interface MessageHandlerOptions {
   imageUrls?: string[];
   videoUrls?: { url: string; mimeType?: string }[]; // Video attachments for Gemini 3 models
   textAttachments?: { name: string; content: string }[]; // Text file attachments
+  pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
   userId?: string;
   username?: string;
   guildId: string;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
-  replyContext?: { // Context when user is replying to Lumia's message
+  replyContext?: { // Context when user is replying to a message
     isReply: boolean;
+    isReplyToLumia?: boolean;
     originalContent?: string;
     originalTimestamp?: string;
+    originalAuthor?: string;
   };
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
   channelHistory?: string; // Recent channel conversation context
@@ -265,7 +282,7 @@ async function processVisionContent(
  * @returns The bot's response with potential reactions
  */
 export async function handleMessage(options: MessageHandlerOptions): Promise<MessageHandlerResponse> {
-  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelHistory, getUserListeningActivity, orchestratorEventId, requestFollowUp } = options;
+  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelHistory, getUserListeningActivity, orchestratorEventId, requestFollowUp } = options;
 
   try {
     // Parse message for pronouns and mentions BEFORE processing
@@ -351,6 +368,7 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       images: processedImages, // Only pass images if not using vision secondary model
       videos: processedVideos, // Only pass videos if not using vision secondary model
       textAttachments,
+      pageContents,
       userId,
       username,
       guildId,

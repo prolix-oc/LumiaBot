@@ -80,6 +80,12 @@ export const config = {
     // Max text file size in KB (default: 25)
     maxTextFileSizeKB: parseInt(process.env.ATTACHMENTS_MAX_TEXT_SIZE_KB || '25'),
   },
+  pageExtraction: {
+    enabled: process.env.PAGE_EXTRACTION_ENABLED !== 'false',
+    maxUrls: parseInt(process.env.PAGE_EXTRACTION_MAX_URLS || '3'),
+    maxContentLength: parseInt(process.env.PAGE_EXTRACTION_MAX_CONTENT_KB || '50') * 1024,
+    timeoutMs: parseInt(process.env.PAGE_EXTRACTION_TIMEOUT_MS || '10000'),
+  },
   orchestrator: {
     // Optional: Enable orchestrator integration for multi-bot coordination
     enabled: process.env.ORCHESTRATOR_ENABLED === 'true',
