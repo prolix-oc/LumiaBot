@@ -33,7 +33,7 @@ export class VideoService {
    * Check if video service is available (Gemini API key is configured)
    */
   isAvailable(): boolean {
-    return config.gemini.enabled;
+    return config.gemini.enabled || config.openai.videoEnabled;
   }
 
   /**
@@ -42,8 +42,8 @@ export class VideoService {
    * Returns the video data for inline use in Gemini requests
    */
   async processVideo(videoUrl: string, mimeType?: string): Promise<ProcessedVideo | null> {
-    if (!config.gemini.enabled) {
-      console.error('❌ [VIDEO] Gemini API key not configured');
+    if (!this.isAvailable()) {
+      console.error('❌ [VIDEO] Video processing not available (set GEMINI_API_KEY or OPENAI_VIDEO_ENABLED=true)');
       return null;
     }
 
@@ -205,9 +205,9 @@ export class VideoService {
    */
   async convertGifToVideo(gifUrl: string): Promise<ProcessedVideo | null> {
     const startTime = Date.now();
-    
-    if (!config.gemini.enabled) {
-      console.error('❌ [GIF] Gemini API key not configured');
+
+    if (!this.isAvailable()) {
+      console.error('❌ [GIF] Video processing not available (set GEMINI_API_KEY or OPENAI_VIDEO_ENABLED=true)');
       return null;
     }
 

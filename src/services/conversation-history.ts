@@ -120,16 +120,18 @@ export class ConversationHistoryService {
    */
   getHistory(userId: string, guildId: string): ChatMessage[] {
     const results = this.db.query(
-      `SELECT role, content, timestamp 
-       FROM conversation_messages 
+      `SELECT role, content, username, timestamp
+       FROM conversation_messages
        WHERE user_id = ? AND guild_id = ?
        ORDER BY timestamp ASC`
-    ).all(userId, guildId) as Array<{ role: 'user' | 'assistant'; content: string; timestamp: string }>;
+    ).all(userId, guildId) as Array<{ role: 'user' | 'assistant'; content: string; username: string; timestamp: string }>;
 
-    // Convert to ChatMessage format
+    // Convert to ChatMessage format with username attribution on user messages
     return results.map(msg => ({
       role: msg.role,
-      content: msg.content,
+      content: msg.role === 'user' && msg.username
+        ? `[${msg.username}]: ${msg.content}`
+        : msg.content,
     }));
   }
 

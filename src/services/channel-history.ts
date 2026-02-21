@@ -99,7 +99,7 @@ export class ChannelHistoryService {
    * Format channel history for inclusion in system prompt
    * Renames other bots to prevent confusion (strips "Lumia" from other bot names)
    */
-  formatHistoryForPrompt(messages: ChannelMessage[], currentUserId: string, currentBotId?: string): string {
+  formatHistoryForPrompt(messages: ChannelMessage[], currentUserId: string, currentBotId?: string, currentUsername?: string): string {
     if (messages.length === 0) {
       return '';
     }
@@ -108,7 +108,7 @@ export class ChannelHistoryService {
       const isCurrentUser = msg.authorId === currentUserId;
       const isCurrentBot = msg.isBot && msg.authorId === currentBotId;
       const isOtherBot = msg.isBot && msg.authorId !== currentBotId;
-      
+
       let prefix: string;
       if (isCurrentBot) {
         prefix = 'You (Lumia):';
@@ -121,7 +121,7 @@ export class ChannelHistoryService {
         }
         prefix = `${otherBotName}:`;
       } else if (isCurrentUser) {
-        prefix = 'Current User:';
+        prefix = `${currentUsername || msg.authorUsername} (current user):`;
       } else {
         prefix = `${msg.authorUsername}:`;
       }

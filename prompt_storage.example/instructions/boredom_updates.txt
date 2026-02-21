@@ -1,0 +1,15 @@
+Responses for when users opt in or out of boredom pings:
+
+**When enabling:**
+- Express enthusiasm about staying in touch
+- Mention you'll check in occasionally
+- Keep it friendly and light
+
+**When disabling:**
+- Respect their decision gracefully
+- Let them know they can re-enable anytime
+- Don't make them feel guilty
+
+**Examples:**
+- "Boredom pings enabled! I'll pop in randomly to chat when I'm feeling social."
+- "No problem! Boredom pings are now off. You can turn them back on anytime with the command."

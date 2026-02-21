@@ -15,7 +15,8 @@ import {
   getBoredomUpdateInstructions,
   getMusicTasteTemplate,
   getReplyContextTemplate,
-  getMemorySystemTemplate
+  getMemorySystemTemplate,
+  getPersonaReinforcement
 } from './prompts';
 
 /**
@@ -46,11 +47,10 @@ export interface ImageContent {
   };
 }
 
-export interface VideoContent {
-  type: 'video';
-  video: {
+export interface VideoUrlContent {
+  type: 'video_url';
+  video_url: {
     url: string;
-    mimeType?: string;
   };
 }
 
@@ -59,7 +59,7 @@ export interface TextContent {
   text: string;
 }
 
-export type ChatContent = string | (TextContent | ImageContent | VideoContent)[];
+export type ChatContent = string | (TextContent | ImageContent | VideoUrlContent)[];
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -104,6 +104,7 @@ export class OpenAIService {
   private defaultTopK: number;
   private filterReasoning: boolean;
   private extraBody?: Record<string, unknown>;
+  private rawBodyParams?: Record<string, unknown>;
 
   constructor(options?: {
     apiKey?: string;
@@ -115,6 +116,7 @@ export class OpenAIService {
     topK?: number;
     filterReasoning?: boolean;
     extraBody?: Record<string, unknown>;
+    rawBodyParams?: Record<string, unknown>;
   }) {
     const clientConfig: { apiKey: string; baseURL?: string } = {
       apiKey: options?.apiKey ?? config.openai.apiKey,
@@ -133,6 +135,7 @@ export class OpenAIService {
     this.defaultTopK = options?.topK ?? config.openai.topK;
     this.filterReasoning = options?.filterReasoning ?? config.openai.filterReasoning;
     this.extraBody = options?.extraBody ?? config.openai.extraBody;
+    this.rawBodyParams = options?.rawBodyParams ?? config.openai.rawBodyParams;
   }
 
   /**
@@ -323,6 +326,11 @@ export class OpenAIService {
           requestParams.extra_body = this.extraBody;
         }
 
+        // Add raw body params directly to request (not wrapped in extra_body)
+        if (this.rawBodyParams) {
+          Object.assign(requestParams, this.rawBodyParams);
+        }
+
         const completion = await this.client.chat.completions.create(requestParams);
 
         let content = completion.choices[0]?.message?.content || '';
@@ -392,13 +400,15 @@ export class OpenAIService {
   }
 
   /**
-   * Build multimodal content for Gemini 3 models with video support
-   * Uses inline base64 data for videos (works with proxies)
+   * Build multimodal content with video support
+   * For Gemini models: uses image_url type for inline base64 video (proxy format)
+   * For other providers (Moonshot, etc.): uses video_url type (standard format)
    */
-  private buildGeminiMultimodalContent(
+  private buildVideoMultimodalContent(
     content: ChatContent,
     images?: string[],
-    videos?: { uri: string; mimeType: string; inlineData: boolean }[]
+    videos?: { uri: string; mimeType: string; inlineData: boolean }[],
+    isGemini: boolean = false
   ): OpenAI.ChatCompletionContentPart[] {
     const parts: OpenAI.ChatCompletionContentPart[] = [];
 
@@ -409,7 +419,7 @@ export class OpenAIService {
       parts.push(...content as OpenAI.ChatCompletionContentPart[]);
     }
 
-    // Add images (standard format works for Gemini too)
+    // Add images (standard format works for all providers)
     if (images && images.length > 0) {
       for (const imageUrl of images) {
         parts.push({
@@ -423,12 +433,19 @@ export class OpenAIService {
     if (videos && videos.length > 0) {
       for (const video of videos) {
         if (video.inlineData) {
-          // Inline base64 video - send as image_url with data URI
-          // Gemini 3 models support this format
-          parts.push({
-            type: 'image_url',
-            image_url: { url: video.uri },
-          });
+          if (isGemini) {
+            // Gemini proxy: uses image_url type for all media including video
+            parts.push({
+              type: 'image_url',
+              image_url: { url: video.uri },
+            });
+          } else {
+            // Moonshot, OpenRouter, etc.: uses video_url type for video content
+            parts.push({
+              type: 'video_url',
+              video_url: { url: video.uri },
+            } as any);
+          }
         }
       }
     }
@@ -522,14 +539,13 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
       }
     }
     
-    // PRIORITY 3: Add recent conversation context (MOST IMPORTANT for current flow)
+    // PRIORITY 3: Conversation history context
+    // The full conversation history (with username attribution) is already in the API messages array.
+    // A brief note here helps the AI connect the dots without duplicating context at different fidelity levels.
     if (userId && guildId) {
-      const conversationContext = conversationHistoryService.formatHistoryForPrompt(userId, guildId);
-      if (conversationContext) {
-        systemPrompt += conversationContext;
-      }
+      systemPrompt += `\n\n## Conversation History\n\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].`;
     }
-    
+
     // PRIORITY 4: Add recent channel conversation history
     if (channelHistory) {
       systemPrompt += channelHistory;
@@ -597,6 +613,12 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       if (musicContext) {
         systemPrompt += musicContext;
       }
+    }
+
+    // Persona reinforcement — end-of-prompt anchor to counteract history drift
+    const reinforcement = getPersonaReinforcement();
+    if (reinforcement) {
+      systemPrompt += '\n\n' + reinforcement;
     }
 
     return systemPrompt;
@@ -705,9 +727,9 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       if (hasImages) parts.push(`${images!.length} image(s)`);
       if (hasVideos) parts.push(`${videos!.length} video(s)`);
       console.log(`\n🖼️  [MULTIMODAL] Request started with ${parts.join(' + ')}`);
-      
-      if (hasVideos && !isGemini) {
-        console.warn(`⚠️  [MULTIMODAL] Videos detected but not using Gemini 3 model - videos will be ignored`);
+
+      if (hasVideos && !isGemini && !config.openai.videoEnabled) {
+        console.warn(`⚠️  [MULTIMODAL] Videos detected but not using Gemini 3 model and OPENAI_VIDEO_ENABLED is not set - videos will be ignored`);
       }
     }
 
@@ -727,36 +749,58 @@ The following are your past thoughts about ${username || 'this user'}. Use these
     // Build system prompt with user memory, guild context, and knowledge
     const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers);
 
-    // Process videos for Gemini 3 models (using inline base64, works with proxies)
+    // Process videos for models that support inline base64 video (Gemini 3 or OPENAI_VIDEO_ENABLED)
     let processedVideos: { uri: string; mimeType: string; inlineData: boolean }[] = [];
-    if (hasVideos && isGemini && videoService.isAvailable()) {
-      console.log(`🎥 [VIDEO] Gemini 3 detected - processing videos as inline base64...`);
+    if (hasVideos && (isGemini || config.openai.videoEnabled) && videoService.isAvailable()) {
+      console.log(`🎥 [VIDEO] Processing videos as inline base64 (${isGemini ? 'Gemini 3' : 'OPENAI_VIDEO_ENABLED'})...`);
       processedVideos = await videoService.processVideos(videos!);
       console.log(`🎥 [VIDEO] Successfully processed ${processedVideos.length}/${videos!.length} videos`);
     }
-     
+
+    // Pre-response persona directive — prepended to last user message so it's
+    // the final text the model reads before generating. Stays in the user role
+    // so it's provider-safe (no mid-conversation system messages).
+    const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';
+
     // Build message array with enhanced system prompt
     const enhancedMessages: OpenAI.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
       ...messages.filter(m => m.role !== 'system').map((m, index, arr) => {
+        const isLastUserMessage = m.role === 'user' && index === arr.length - 1;
+
         // If this is the last user message and we have media, convert to multimodal format
-        if (m.role === 'user' && index === arr.length - 1 && isMultimodal) {
+        if (isLastUserMessage && isMultimodal) {
           let content: OpenAI.ChatCompletionContentPart[];
-          
-          // For Gemini 3 with videos, we need special handling
-          if (isGemini && processedVideos.length > 0) {
-            content = this.buildGeminiMultimodalContent(m.content, images, processedVideos);
+
+          // Use multimodal content with video support for Gemini or OpenAI-compatible video
+          if ((isGemini || config.openai.videoEnabled) && processedVideos.length > 0) {
+            content = this.buildVideoMultimodalContent(m.content, images, processedVideos, isGemini);
           } else {
             content = this.buildMultimodalContent(m.content, images);
           }
-          
+
+          // Prepend persona directive to the first text part
+          const firstTextIdx = content.findIndex(p => p.type === 'text');
+          if (firstTextIdx !== -1) {
+            const textPart = content[firstTextIdx] as OpenAI.ChatCompletionContentPartText;
+            content[firstTextIdx] = { type: 'text', text: PERSONA_DIRECTIVE + '\n\n' + textPart.text };
+          }
+
           console.log(`🖼️  [MULTIMODAL] Built message with ${content.length} content parts`);
           return {
             role: 'user',
             content,
           } as OpenAI.ChatCompletionMessageParam;
         }
-        
+
+        // Last user message (text only) — prepend persona directive
+        if (isLastUserMessage && typeof m.content === 'string') {
+          return {
+            role: m.role,
+            content: PERSONA_DIRECTIVE + '\n\n' + m.content,
+          } as OpenAI.ChatCompletionMessageParam;
+        }
+
         // Regular message
         if (typeof m.content === 'string') {
           return {
@@ -764,7 +808,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
             content: m.content,
           } as OpenAI.ChatCompletionMessageParam;
         }
-        
+
         // Already multimodal content
         return {
           role: m.role,
@@ -775,17 +819,22 @@ The following are your past thoughts about ${username || 'this user'}. Use these
     
     // Clean up uploaded videos after use (in finally block later)
 
-    // If search is not enabled, just do a normal completion (no tools)
-    if (!enableSearch) {
-      console.log(`\n🌐 [AI] Web search not enabled - normal completion`);
-      
+    // Determine if we need tools at all
+    // Memory/interaction tools are always available when user context exists
+    // Search/knowledge tools are gated on their respective flags
+    const hasUserContext = !!(userId && username);
+    const needsTools = enableSearch || enableKnowledgeGraph || hasUserContext || !!options.getUserListeningActivity || !!options.orchestratorEventId;
+
+    if (!needsTools) {
+      console.log(`\n🌐 [AI] No tools needed (no user context or search) - normal completion`);
+
       try {
         const content = await this.generateWithRetry(
           enhancedMessages,
           temperature ?? this.defaultTemperature,
           maxTokens ?? this.defaultMaxTokens
         );
-        
+
         return content;
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -794,8 +843,8 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       }
     }
 
-    // Search is enabled - use runTools helper for automatic function calling
-    console.log(`\n🌐 [AI] Tools enabled - using runTools helper`);
+    // Tools needed - use runTools helper for automatic function calling
+    console.log(`\n🔧 [AI] Tools enabled - using runTools helper (search: ${enableSearch}, knowledge: ${enableKnowledgeGraph}, user context: ${hasUserContext})`);
     
     try {
       console.log(`🌐 [AI] Step 1: AI will decide which tools to use...`);
@@ -1129,12 +1178,16 @@ The following are your past thoughts about ${username || 'this user'}. Use these
         }
       };
 
-      // Build tools array - always include web search and knowledge graph, optionally include user memory
+      // Build tools array
+      // Search/knowledge tools are gated on their flags; memory/interaction tools are always available with user context
       const now = new Date();
       const currentDate = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-      
-      const tools: any[] = [
-        {
+
+      const tools: any[] = [];
+
+      // Web search tool - only when search intent detected
+      if (enableSearch) {
+        tools.push({
           type: 'function',
           function: {
             function: webSearchFunction,
@@ -1152,8 +1205,12 @@ The following are your past thoughts about ${username || 'this user'}. Use these
               required: ['query'],
             },
           },
-        },
-        {
+        });
+      }
+
+      // Knowledge graph tool - only when knowledge intent detected
+      if (enableKnowledgeGraph) {
+        tools.push({
           type: 'function',
           function: {
             function: queryKnowledgeBaseFunction,
@@ -1175,21 +1232,23 @@ The following are your past thoughts about ${username || 'this user'}. Use these
               required: ['query'],
             },
           },
-        },
-        {
-          type: 'function',
-          function: {
-            function: getMusicTasteFunction,
-            parse: JSON.parse,
-            description: 'Get your music taste information - what songs, artists, and genres you know. Use this when someone asks about your music taste, what you listen to, your favorite songs, or wants music recommendations. Returns real tracks from your imported Spotify playlists.',
-            name: 'get_music_taste',
-            parameters: {
-              type: 'object',
-              properties: {},
-            },
+        });
+      }
+
+      // Music taste tool - always available
+      tools.push({
+        type: 'function',
+        function: {
+          function: getMusicTasteFunction,
+          parse: JSON.parse,
+          description: 'Get your music taste information - what songs, artists, and genres you know. Use this when someone asks about your music taste, what you listen to, your favorite songs, or wants music recommendations. Returns real tracks from your imported Spotify playlists.',
+          name: 'get_music_taste',
+          parameters: {
+            type: 'object',
+            properties: {},
           },
         },
-      ];
+      });
 
       // Add user current listening tool if callback is provided
       if (options.getUserListeningActivity) {
@@ -1213,7 +1272,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
         });
       }
 
-      // Add user memory tools if we have user info
+      // User memory/interaction tools - always available when user context exists
       if (userId && username) {
         tools.push(
           {
@@ -1502,6 +1561,11 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             runToolsParams.extra_body = this.extraBody;
           }
 
+          // Add raw body params directly to request (not wrapped in extra_body)
+          if (this.rawBodyParams) {
+            Object.assign(runToolsParams, this.rawBodyParams);
+          }
+
           // Use runTools to automatically handle the function calling loop
           // Note: runTools is available in the beta namespace of the OpenAI SDK
           const runner = this.client.beta.chat.completions.runTools(runToolsParams);
@@ -1567,15 +1631,15 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       if (hasVideos) parts.push(`${videos!.length} video(s)`);
       console.log(`\n🖼️  [MULTIMODAL STREAM] Request started with ${parts.join(' + ')}`);
 
-      if (hasVideos && !isGemini) {
-        console.warn(`⚠️  [MULTIMODAL STREAM] Videos detected but not using Gemini 3 model - videos will be ignored`);
+      if (hasVideos && !isGemini && !config.openai.videoEnabled) {
+        console.warn(`⚠️  [MULTIMODAL STREAM] Videos detected but not using Gemini 3 model and OPENAI_VIDEO_ENABLED is not set - videos will be ignored`);
       }
     }
 
-    // Process videos for Gemini 3 models (using inline base64, works with proxies)
+    // Process videos for models that support inline base64 video (Gemini 3 or OPENAI_VIDEO_ENABLED)
     let processedVideos: { uri: string; mimeType: string; inlineData: boolean }[] = [];
-    if (hasVideos && isGemini && videoService.isAvailable()) {
-      console.log(`🎥 [VIDEO STREAM] Gemini 3 detected - processing videos as inline base64...`);
+    if (hasVideos && (isGemini || config.openai.videoEnabled) && videoService.isAvailable()) {
+      console.log(`🎥 [VIDEO STREAM] Processing videos as inline base64 (${isGemini ? 'Gemini 3' : 'OPENAI_VIDEO_ENABLED'})...`);
       processedVideos = await videoService.processVideos(videos!);
       console.log(`🎥 [VIDEO STREAM] Successfully processed ${processedVideos.length}/${videos!.length} videos`);
     }
@@ -1596,27 +1660,47 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     // Build system prompt with user memory, guild context, and knowledge
     const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers);
 
+    // Pre-response persona directive — prepended to last user message
+    const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';
+
     const enhancedMessages: OpenAI.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
       ...messages.filter(m => m.role !== 'system').map((m, index, arr) => {
+        const isLastUserMessage = m.role === 'user' && index === arr.length - 1;
+
         // If this is the last user message and we have media, convert to multimodal format
-        if (m.role === 'user' && index === arr.length - 1 && isMultimodal) {
+        if (isLastUserMessage && isMultimodal) {
           let content: OpenAI.ChatCompletionContentPart[];
-          
-          // For Gemini 3 with videos, we need special handling
-          if (isGemini && processedVideos.length > 0) {
-            content = this.buildGeminiMultimodalContent(m.content, images, processedVideos);
+
+          // Use multimodal content with video support for Gemini or OpenAI-compatible video
+          if ((isGemini || config.openai.videoEnabled) && processedVideos.length > 0) {
+            content = this.buildVideoMultimodalContent(m.content, images, processedVideos, isGemini);
           } else {
             content = this.buildMultimodalContent(m.content, images);
           }
-          
+
+          // Prepend persona directive to the first text part
+          const firstTextIdx = content.findIndex(p => p.type === 'text');
+          if (firstTextIdx !== -1) {
+            const textPart = content[firstTextIdx] as OpenAI.ChatCompletionContentPartText;
+            content[firstTextIdx] = { type: 'text', text: PERSONA_DIRECTIVE + '\n\n' + textPart.text };
+          }
+
           console.log(`🖼️  [MULTIMODAL STREAM] Built message with ${content.length} content parts`);
           return {
             role: 'user',
             content,
           } as OpenAI.ChatCompletionMessageParam;
         }
-        
+
+        // Last user message (text only) — prepend persona directive
+        if (isLastUserMessage && typeof m.content === 'string') {
+          return {
+            role: m.role,
+            content: PERSONA_DIRECTIVE + '\n\n' + m.content,
+          } as OpenAI.ChatCompletionMessageParam;
+        }
+
         // Regular message
         if (typeof m.content === 'string') {
           return {
@@ -1624,7 +1708,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             content: m.content,
           } as OpenAI.ChatCompletionMessageParam;
         }
-        
+
         // Already multimodal content
         return {
           role: m.role,
@@ -1661,6 +1745,11 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       // Add extra_body if configured (for custom provider parameters)
       if (this.extraBody) {
         streamParams.extra_body = this.extraBody;
+      }
+
+      // Add raw body params directly to request (not wrapped in extra_body)
+      if (this.rawBodyParams) {
+        Object.assign(streamParams, this.rawBodyParams);
       }
 
       const stream = await this.client.chat.completions.create(streamParams as OpenAI.ChatCompletionCreateParamsStreaming);

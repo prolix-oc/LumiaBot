@@ -29,6 +29,15 @@ export const config = {
         return undefined;
       }
     })(),
+    rawBodyParams: (() => {
+      try {
+        return process.env.OPENAI_RAW_BODY_PARAMS ? JSON.parse(process.env.OPENAI_RAW_BODY_PARAMS) : undefined;
+      } catch (e) {
+        console.warn('⚠️ [Config] Failed to parse OPENAI_RAW_BODY_PARAMS as JSON, ignoring');
+        return undefined;
+      }
+    })(),
+    videoEnabled: process.env.OPENAI_VIDEO_ENABLED === 'true',
   },
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || undefined,

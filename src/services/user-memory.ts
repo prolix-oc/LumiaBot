@@ -22,6 +22,8 @@ export interface ExtractedMention {
 }
 
 export class UserMemoryService {
+  private static readonly MAX_OPINION_ENTRIES = 10;
+  private static readonly MAX_THIRD_PARTY_ENTRIES = 15;
   private db: Database;
 
   constructor() {
@@ -85,17 +87,22 @@ export class UserMemoryService {
     const existing = this.getOpinion(userId);
     
     if (existing) {
-      // Update existing opinion - append new thoughts
-      const combinedOpinion = `${existing.opinion}\n\n[${now}] ${opinion}`;
-      
+      // Update existing opinion - append new thoughts with rolling window
+      const entries = existing.opinion.split(/\n\n(?=\[)/);
+      entries.push(`[${now}] ${opinion}`);
+
+      // Keep only the most recent entries to prevent unbounded growth
+      const trimmed = entries.slice(-UserMemoryService.MAX_OPINION_ENTRIES);
+      const combinedOpinion = trimmed.join('\n\n');
+
       this.db.run(
-        `UPDATE user_opinions 
+        `UPDATE user_opinions
          SET opinion = ?, sentiment = ?, updated_at = ?
          WHERE user_id = ?`,
         [combinedOpinion, sentiment, now, userId]
       );
-      
-      console.log(`💾 [USER MEMORY] Updated opinion for ${username} (${sentiment})`);
+
+      console.log(`💾 [USER MEMORY] Updated opinion for ${username} (${sentiment}, ${trimmed.length} entries)`);
     } else {
       // Insert new opinion
       this.db.run(
@@ -151,19 +158,24 @@ export class UserMemoryService {
     const contextEntry = `[${now}] ${mention.mentionedBy} mentioned: "${mention.context}"`;
     
     if (existing) {
-      // Append to existing third party context
-      const combinedContext = existing.thirdPartyContext 
-        ? `${existing.thirdPartyContext}\n${contextEntry}`
-        : contextEntry;
-      
+      // Append to existing third party context with rolling window
+      const existingEntries = existing.thirdPartyContext
+        ? existing.thirdPartyContext.split(/\n(?=\[)/)
+        : [];
+      existingEntries.push(contextEntry);
+
+      // Keep only the most recent entries to prevent unbounded growth
+      const trimmed = existingEntries.slice(-UserMemoryService.MAX_THIRD_PARTY_ENTRIES);
+      const combinedContext = trimmed.join('\n');
+
       this.db.run(
-        `UPDATE user_opinions 
+        `UPDATE user_opinions
          SET third_party_context = ?, updated_at = ?
          WHERE user_id = ?`,
         [combinedContext, now, mention.userId]
       );
-      
-      console.log(`💾 [USER MEMORY] Added third-party context for ${mention.username}`);
+
+      console.log(`💾 [USER MEMORY] Added third-party context for ${mention.username} (${trimmed.length} entries)`);
     } else {
       // Insert new record
       this.db.run(
@@ -252,10 +264,8 @@ Sentiment: ${opinion.sentiment}
 Your thoughts: ${opinion.opinion}
 `;
 
-    // Add pronouns if known - make them prominent!
-    if (opinion.pronouns) {
-      context += `\n📋 **Pronouns: ${opinion.pronouns}**\n✅ **Always use these pronouns when referring to ${opinion.username}**\n`;
-    }
+    // Pronouns are displayed in the CURRENT USER CONTEXT section of the system prompt
+    // so they are intentionally not duplicated here
 
     // Add third-party context if exists
     if (opinion.thirdPartyContext) {

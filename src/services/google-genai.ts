@@ -15,7 +15,8 @@ import {
   getBoredomUpdateInstructions,
   getMusicTasteTemplate,
   getReplyContextTemplate,
-  getMemorySystemTemplate
+  getMemorySystemTemplate,
+  getPersonaReinforcement
 } from './prompts';
 
 /**
@@ -361,14 +362,13 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
       }
     }
     
-    // PRIORITY 3: Add recent conversation context (MOST IMPORTANT for current flow)
+    // PRIORITY 3: Conversation history context
+    // The full conversation history (with username attribution) is already in the API messages array.
+    // A brief note here helps the AI connect the dots without duplicating context at different fidelity levels.
     if (userId && guildId) {
-      const conversationContext = conversationHistoryService.formatHistoryForPrompt(userId, guildId);
-      if (conversationContext) {
-        systemPrompt += conversationContext;
-      }
+      systemPrompt += `\n\n## Conversation History\n\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].`;
     }
-    
+
     // PRIORITY 4: Add recent channel conversation history
     if (channelHistory) {
       systemPrompt += channelHistory;
@@ -435,6 +435,12 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       if (musicContext) {
         systemPrompt += musicContext;
       }
+    }
+
+    // Persona reinforcement — end-of-prompt anchor to counteract history drift
+    const reinforcement = getPersonaReinforcement();
+    if (reinforcement) {
+      systemPrompt += '\n\n' + reinforcement;
     }
 
     return systemPrompt;
@@ -1349,12 +1355,25 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       
       // Convert messages (system prompt will be used instead of extracting from messages)
       let { contents } = await this.convertMessages(options.messages, images, videos);
-      
+
       // Validate we have at least one valid content message
       if (contents.length === 0) {
         throw new Error('No valid messages to send - all messages were empty or invalid');
       }
-      
+
+      // Pre-response persona directive — prepend to last user message's text part
+      const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';
+      for (let i = contents.length - 1; i >= 0; i--) {
+        if (contents[i]?.role === 'user' && contents[i]?.parts) {
+          const textPartIdx = contents[i]!.parts!.findIndex((p: any) => p.text);
+          if (textPartIdx !== -1) {
+            const part = contents[i]!.parts![textPartIdx] as any;
+            part.text = PERSONA_DIRECTIVE + '\n\n' + part.text;
+          }
+          break;
+        }
+      }
+
       const genConfig = this.buildConfig(options, systemPrompt);
 
       console.log(`🔮 [Google GenAI] Sending ${contents.length} messages to ${this.model}`);
@@ -1400,12 +1419,25 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       
       // Convert messages (system prompt will be used instead of extracting from messages)
       const { contents } = await this.convertMessages(options.messages, images, videos);
-      
+
       // Validate we have at least one valid content message
       if (contents.length === 0) {
         throw new Error('No valid messages to send - all messages were empty or invalid');
       }
-      
+
+      // Pre-response persona directive — prepend to last user message's text part
+      const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';
+      for (let i = contents.length - 1; i >= 0; i--) {
+        if (contents[i]?.role === 'user' && contents[i]?.parts) {
+          const textPartIdx = contents[i]!.parts!.findIndex((p: any) => p.text);
+          if (textPartIdx !== -1) {
+            const part = contents[i]!.parts![textPartIdx] as any;
+            part.text = PERSONA_DIRECTIVE + '\n\n' + part.text;
+          }
+          break;
+        }
+      }
+
       const genConfig = this.buildConfig(options, systemPrompt);
 
       console.log(`🔮 [Google GenAI] Streaming ${contents.length} messages to ${this.model}`);

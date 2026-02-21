@@ -302,6 +302,15 @@ export function getMemorySystemTemplate(variables: {
 }
 
 /**
+ * Get persona reinforcement text (appended to end of system prompt)
+ * Returns empty string if file doesn't exist — feature is opt-in via file presence
+ */
+export function getPersonaReinforcement(): string {
+  const reinforcement = loadTextFile('persona/reinforcement.txt');
+  return reinforcement ? substituteVariables(reinforcement) : '';
+}
+
+/**
  * Get trigger keywords configuration
  */
 export function getTriggerKeywords(): {

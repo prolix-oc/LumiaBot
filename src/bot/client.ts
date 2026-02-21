@@ -732,7 +732,7 @@ export class DiscordBot {
           if (canType) {
             try {
               const channelMessages = await channelHistoryService.fetchChannelHistory(message.channel as TextChannel | ThreadChannel | NewsChannel | VoiceChannel | StageChannel | DMChannel, message.id);
-              channelHistory = channelHistoryService.formatHistoryForPrompt(channelMessages, message.author.id, this.client.user?.id);
+              channelHistory = channelHistoryService.formatHistoryForPrompt(channelMessages, message.author.id, this.client.user?.id, message.author.username);
               if (channelHistory) {
                 console.log(`📜 [CLIENT] Added channel history context (${channelMessages.length} messages)`);
               }

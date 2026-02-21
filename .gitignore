@@ -42,7 +42,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 !BOT_SETUP.md
 !LICENSE.md
 !knowledge_documents/README.md
-**/*.txt
 
 # Bot definitions - these are private and should not be committed
 prompt_storage/
