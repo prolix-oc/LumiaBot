@@ -596,6 +596,10 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
     // PRIORITY 6: Add stored memory/opinion context (LOWER PRIORITY than recent conversation)
     // This prevents old memories from overriding current conversation flow
     if (userId) {
+      // Sync stored username with current Discord username to prevent stale names in context
+      if (username) {
+        userMemoryService.syncUsername(userId, username);
+      }
       const memoryContext = userMemoryService.getOpinionContext(userId);
       
       if (memoryContext) {

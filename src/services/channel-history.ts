@@ -97,12 +97,14 @@ export class ChannelHistoryService {
 
   /**
    * Format channel history for inclusion in system prompt
-   * Renames other bots to prevent confusion (strips "Lumia" from other bot names)
+   * Renames other bots to prevent confusion (strips current bot's name from other bot names)
    */
   formatHistoryForPrompt(messages: ChannelMessage[], currentUserId: string, currentBotId?: string, currentUsername?: string): string {
     if (messages.length === 0) {
       return '';
     }
+
+    const botName = config.bot.name;
 
     const formatted = messages.map(msg => {
       const isCurrentUser = msg.authorId === currentUserId;
@@ -111,12 +113,15 @@ export class ChannelHistoryService {
 
       let prefix: string;
       if (isCurrentBot) {
-        prefix = 'You (Lumia):';
+        prefix = `You (${botName}):`;
       } else if (isOtherBot) {
-        // Rename other bots to strip "Lumia" and prevent confusion
-        // "Ditsy Slime Girl Lumia" becomes "Ditsy Slime Girl", "Lumia" becomes "Other Bot"
-        let otherBotName = msg.authorUsername.replace(/\s*Lumia\s*/gi, '').trim();
-        if (!otherBotName || otherBotName.toLowerCase() === 'lumia') {
+        // Rename other bots to strip shared naming patterns and prevent identity confusion
+        // e.g. if botName is "Bad Kitty", strip "Lumia" from "Ditsy Slime Girl Lumia"
+        // This prevents the AI from confusing itself with other bot instances
+        let otherBotName = msg.authorUsername;
+        // Strip "Lumia" (shared brand name across bot instances) to differentiate
+        otherBotName = otherBotName.replace(/\s*Lumia\s*/gi, '').trim();
+        if (!otherBotName) {
           otherBotName = 'Other Bot';
         }
         prefix = `${otherBotName}:`;

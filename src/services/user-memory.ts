@@ -189,6 +189,24 @@ export class UserMemoryService {
   }
 
   /**
+   * Sync the stored username with the current Discord username.
+   * Prevents stale/incorrect usernames from being injected into the system prompt.
+   */
+  syncUsername(userId: string, currentUsername: string): void {
+    const existing = this.db.query(
+      'SELECT username FROM user_opinions WHERE user_id = ? LIMIT 1'
+    ).get(userId) as { username: string } | undefined;
+
+    if (existing && existing.username !== currentUsername) {
+      this.db.run(
+        'UPDATE user_opinions SET username = ? WHERE user_id = ?',
+        [currentUsername, userId]
+      );
+      console.log(`💾 [USER MEMORY] Synced username for ${userId}: "${existing.username}" → "${currentUsername}"`);
+    }
+  }
+
+  /**
    * Get opinion for a specific user
    */
   getOpinion(userId: string): UserOpinion | null {

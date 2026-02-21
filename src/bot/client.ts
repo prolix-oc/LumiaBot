@@ -762,10 +762,29 @@ export class DiscordBot {
             }
           }
 
+          // Identify URLs that will be scraped for page content, so we can skip their embed images
+          const scrapedUrls = config.pageExtraction.enabled
+            ? pageExtractorService.extractUrls(cleanedContent)
+            : [];
+
+          // Helper: check if an embed's source URL matches any URL we're scraping
+          const isFromScrapedLink = (embedUrl: string | null): boolean => {
+            if (!embedUrl || scrapedUrls.length === 0) return false;
+            return scrapedUrls.some(scraped =>
+              embedUrl === scraped || embedUrl.startsWith(scraped) || scraped.startsWith(embedUrl)
+            );
+          };
+
           // Extract embeds from current message (forwarded messages, etc.)
           if (message.embeds.length > 0) {
             for (const embed of message.embeds) {
               const embedType = embed.data?.type;
+              const isScrapedLink = isFromScrapedLink(embed.url);
+
+              if (isScrapedLink) {
+                console.log(`🌐 [CLIENT] Skipping embed for scraped URL: ${embed.url} (type: ${embedType})`);
+                continue;
+              }
 
               if (embedType === 'gifv' && embed.video?.url) {
                 videoUrls.push({ url: embed.video.url, mimeType: 'image/gif' });
