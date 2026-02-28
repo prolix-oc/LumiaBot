@@ -14,5 +14,9 @@
   "searchWeb": {
     "name": "search_web",
     "description": "Search the web for current information, news, or facts that might be relevant to the conversation."
+  },
+  "searchUsers": {
+    "name": "search_users",
+    "description": "Search for a user by partial name, nickname, or informal reference. Use this to resolve who someone is talking about, get their Discord ID for pings (<@userId>), recall stored opinions, or check their pronouns."
   }
 }

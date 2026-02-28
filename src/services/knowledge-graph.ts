@@ -314,33 +314,23 @@ export class KnowledgeGraphService {
    * Formatted to encourage chaotic, non-robotic responses
    */
   private formatKnowledgeContext(results: KnowledgeSearchResult[]): string {
-    const sections = results.map((result, index) => {
+    const sections = results.map((result) => {
       const doc = result.document;
-      
-      let section = `📖 SECRET ARCHIVE: ${doc.title}\n`;
-      
+
+      let section = `${doc.title}\n`;
+
       if (doc.type === 'link' && doc.url) {
-        section += `[Secret stash location: ${doc.url}]\n`;
+        section += `[${doc.url}]\n`;
       }
-      
-      section += `${doc.content}\n`;
-      
-      if (result.matchedKeywords.length > 0) {
-        section += `(Found via: ${result.matchedKeywords.join(', ')})`;
-      }
+
+      section += doc.content;
 
       return section;
     });
 
-    return `╔════════════════════════════════════════════════════════════╗
-║  📚 KNOWLEDGE FROM YOUR SECRET ARCHIVES 📚                 ║
-║  (Use naturally - NEVER be robotic or assistant-like!)     ║
-╚════════════════════════════════════════════════════════════╝
-
-${sections.join('\n\n---\n\n')}
-
-💡 Remember: You're sharing secrets from your stash, not reading a textbook!
-Make it sound natural and chaotic in your own voice! ✧ω✧`;
+    return `<knowledge-base>
+${sections.join('\n\n')}
+</knowledge-base>`;
   }
 
   /**

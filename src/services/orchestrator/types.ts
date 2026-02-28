@@ -13,6 +13,11 @@ export interface MessageContext {
   maxTurns: number;
   isBanter: boolean;
   respondingBotId?: string;
+  // Who this bot is replying to (for natural conversational context)
+  replyingToBotId?: string;
+  replyingToBotName?: string;
+  // Discord message ID to reply to (for threading bot responses)
+  replyToMessageId?: string;
   // Spatial awareness: other bots in the same guild
   nearbyBots?: BotPresence[];
 }
@@ -63,12 +68,14 @@ export interface ResponseRequestPayload {
   originalMessageId?: string;
   channelId?: string;
   guildId?: string;
+  replyToMessageId?: string;
 }
 
 export interface ResponseCompletePayload {
   turnId: string;
   botId: string;
   responseContent: string;
+  responseMessageId?: string; // Discord message ID of the bot's response
   nextBotId?: string;
 }
 

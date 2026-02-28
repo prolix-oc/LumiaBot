@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
-import { config, isGemini3Model } from '../utils/config';
+import { config, isGemini3Model, isDeepSeekModel, isMoonshotThinkingModel, isGeminiFlashModel, isGeminiProModel } from '../utils/config';
 import { searxngService } from './searxng';
-import { userMemoryService } from './user-memory';
+import { userMemoryService, PRONOUN_FALLBACK } from './user-memory';
 import { conversationHistoryService } from './conversation-history';
 import { guildMemoryService } from './guild-memory';
 import { boredomService } from './boredom';
@@ -139,6 +139,42 @@ export class OpenAIService {
     this.filterReasoning = options?.filterReasoning ?? config.openai.filterReasoning;
     this.extraBody = options?.extraBody ?? config.openai.extraBody;
     this.rawBodyParams = options?.rawBodyParams ?? config.openai.rawBodyParams;
+  }
+
+  /**
+   * Apply model-aware thinking configuration to request params.
+   * Mutates the given params object in-place.
+   */
+  private applyThinkingConfig(params: any, isGemini: boolean): void {
+    if (!config.thinking.enabled) {
+      // Thinking disabled — use minimal/disabled for all models
+      if (isGemini) {
+        params.thinking_config = { thinking_level: 'MINIMAL' };
+      }
+      return;
+    }
+
+    // Gemini via OpenAI proxy
+    if (isGemini) {
+      const level = isGeminiProModel() ? 'HIGH' : isGeminiFlashModel() ? 'MEDIUM' : 'MINIMAL';
+      params.thinking_config = { thinking_level: level };
+      console.log(`🧠 [AI] Gemini thinking enabled at level: ${level}`);
+      return;
+    }
+
+    // DeepSeek models
+    if (isDeepSeekModel()) {
+      params.extra_body = { ...params.extra_body, thinking: { type: 'enabled' } };
+      console.log(`🧠 [AI] DeepSeek thinking enabled`);
+      return;
+    }
+
+    // Moonshot / Kimi thinking models — force temperature 1.0
+    if (isMoonshotThinkingModel()) {
+      params.temperature = 1.0;
+      console.log(`🧠 [AI] Moonshot thinking model detected, temperature set to 1.0`);
+      return;
+    }
   }
 
   /**
@@ -317,16 +353,12 @@ export class OpenAIService {
           requestParams.top_k = this.defaultTopK;
         }
 
-        // Disable reasoning for Gemini models to prevent leaks
-        if (isGemini) {
-          requestParams.thinking_config = {
-            thinking_level: 'MINIMAL' // MINIMAL, LOW, MEDIUM, HIGH
-          };
-        }
+        // Apply model-aware thinking configuration
+        this.applyThinkingConfig(requestParams, isGemini);
 
         // Add extra_body if configured (for custom provider parameters)
         if (this.extraBody) {
-          requestParams.extra_body = this.extraBody;
+          requestParams.extra_body = { ...requestParams.extra_body, ...this.extraBody };
         }
 
         // Add raw body params directly to request (not wrapped in extra_body)
@@ -377,6 +409,44 @@ export class OpenAIService {
     // All retries exhausted
     console.error(`🚫 [AI] All ${maxRetries} attempts failed`);
     throw lastError || new Error('Failed to generate response after multiple attempts');
+  }
+
+  /**
+   * Download an image from a URL and return it as a base64 data URI.
+   * Discord CDN URLs contain auth tokens that external APIs cannot access,
+   * so we fetch the image ourselves and inline the data.
+   */
+  private async convertImageUrlToBase64(url: string): Promise<string> {
+    // Already a data URI — pass through
+    if (url.startsWith('data:')) return url;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image: ${response.status} ${response.statusText}`);
+    }
+    const contentType = response.headers.get('content-type') || 'image/png';
+    const buffer = await response.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString('base64');
+    return `data:${contentType};base64,${base64}`;
+  }
+
+  /**
+   * Convert an array of image URLs to base64 data URIs.
+   * Logs progress and skips images that fail to download.
+   */
+  private async processImageUrls(imageUrls: string[]): Promise<string[]> {
+    console.log(`🖼️  [IMAGE] Converting ${imageUrls.length} image URL(s) to base64...`);
+    const results: string[] = [];
+    for (const url of imageUrls) {
+      try {
+        const dataUri = await this.convertImageUrlToBase64(url);
+        results.push(dataUri);
+      } catch (error) {
+        console.error(`❌ [IMAGE] Failed to convert image to base64: ${error}`);
+      }
+    }
+    console.log(`🖼️  [IMAGE] Successfully converted ${results.length}/${imageUrls.length} image(s)`);
+    return results;
   }
 
   private buildMultimodalContent(content: ChatContent, images?: string[]): OpenAI.ChatCompletionContentPart[] {
@@ -486,68 +556,48 @@ export class OpenAIService {
       timeZoneName: 'short'
     });
     
-    let systemPrompt = `╔════════════════════════════════════════════════════════════════╗
-║  📅 CURRENT DATE & TIME                                         ║
-╚════════════════════════════════════════════════════════════════╝
-
+    let systemPrompt = `<datetime>
 Today is ${currentDateTime}.
+</datetime>
 
-${botDefinition}`;
+<identity>
+${botDefinition}
+</identity>`;
     
     // PRIORITY 1: Add explicit current user identification
     // This MUST be prominent so the bot always knows who it's talking to
     if (username) {
-      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
-║  👤 CURRENT USER CONTEXT                                        ║
-╚════════════════════════════════════════════════════════════════╝
-
-You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
-
-⚠️  CRITICAL - USER IDENTIFICATION RULES:
-1. **MESSAGE AUTHOR:** The current message was sent by the user shown above - always address THEM, not others
-2. **MENTIONED USERS:** Users explicitly pinged/mentioned in the current message${mentionedUsers && mentionedUsers.size > 0 ? ' (see below)' : ''} - if responding TO or ABOUT them, use THEIR name
-3. **CONVERSATION HISTORY:** Other users mentioned in previous messages below - they are NOT the current author unless explicitly stated
-
-❌ NEVER confuse the current author with users mentioned in conversation history
-✅ If the current author says "Hey @OtherUser", they are talking TO OtherUser, not AS OtherUser`;
-
-      // Get and display pronouns prominently
-      if (userId) {
-        const pronouns = userMemoryService.getPronouns(userId);
-        if (pronouns) {
-          systemPrompt += `\n\n📋 **Pronouns:** ${pronouns}\n✅ **ALWAYS use these pronouns when referring to the current user**`;
-        } else {
-          systemPrompt += `\n\n📋 **Pronouns:** Not specified yet. If the current user mentions their pronouns, make sure to note them!`;
-        }
-      }
+      const pronouns = userId ? userMemoryService.getPronouns(userId) : null;
+      const pronounsAttr = pronouns ? ` pronouns="${pronouns}"` : '';
+      systemPrompt += `\n\n<current-user name="${username}"${userId ? ` id="${userId}"` : ''}${pronounsAttr}>
+The current message author. Address THEM — not users from conversation history.
+If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
       // Add explicitly mentioned users section if present
       if (mentionedUsers && mentionedUsers.size > 0) {
-        systemPrompt += `\n\n👥 **USERS MENTIONED IN THIS MESSAGE:**\n`;
+        systemPrompt += `\n\n<mentioned-users>`;
         mentionedUsers.forEach((name, id) => {
           if (id !== userId) { // Don't list the author as a mention
-            systemPrompt += `• ${name} (ID: ${id})\n`;
+            systemPrompt += `\n- ${name} (ID: ${id})`;
           }
         });
-        systemPrompt += `\n⚠️ These users were explicitly pinged by the current author. If they are asking you to interact with or respond to one of them, use the MENTIONED user's name, not the current user's.`;
+        systemPrompt += `\n</mentioned-users>`;
       }
 
-      systemPrompt += '\n';
+      systemPrompt += '\n</current-user>\n';
     }
     
     // PRIORITY 2: Add video-specific instructions if videos are present
     if (hasVideos) {
       const videoInstructions = getVideoReactionInstructions();
       if (videoInstructions) {
-        systemPrompt += '\n\n' + videoInstructions;
+        systemPrompt += `\n\n<video-instructions>\n${videoInstructions}\n</video-instructions>`;
       }
     }
-    
+
     // PRIORITY 3: Conversation history context
-    // The full conversation history (with username attribution) is already in the API messages array.
-    // A brief note here helps the AI connect the dots without duplicating context at different fidelity levels.
     if (userId && guildId) {
-      systemPrompt += `\n\n## Conversation History\n\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].`;
+      systemPrompt += `\n\n<conversation-history-note>\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].\n</conversation-history-note>`;
     }
 
     // PRIORITY 4: Add recent channel conversation history
@@ -562,22 +612,20 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
     
     // Add text file attachments if present
     if (textAttachments && textAttachments.length > 0) {
-      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
-║  📎 ATTACHED FILES                                              ║
-╚════════════════════════════════════════════════════════════════╝\n`;
+      systemPrompt += `\n\n<attached-files>`;
       for (const attachment of textAttachments) {
-        systemPrompt += `\n--- File: ${attachment.name} ---\n${attachment.content}\n--- End of ${attachment.name} ---\n`;
+        systemPrompt += `\n<file name="${attachment.name}">\n${attachment.content}\n</file>`;
       }
+      systemPrompt += `\n</attached-files>`;
     }
 
     // Add extracted web page contents if present
     if (pageContents && pageContents.length > 0) {
-      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
-║  🌐 EXTRACTED WEB PAGES                                        ║
-╚════════════════════════════════════════════════════════════════╝\n`;
+      systemPrompt += `\n\n<web-pages>`;
       for (const page of pageContents) {
-        systemPrompt += `\n--- Page: ${page.title} (${page.url}) ---\n${page.content}\n--- End of page ---\n`;
+        systemPrompt += `\n<page title="${page.title}" url="${page.url}">\n${page.content}\n</page>`;
       }
+      systemPrompt += `\n</web-pages>`;
     }
 
     // Add guild-specific context if available
@@ -603,9 +651,7 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
       const memoryContext = userMemoryService.getOpinionContext(userId);
       
       if (memoryContext) {
-        systemPrompt += `\n\n## 📚 STORED MEMORIES (Reference Only)
-
-The following are your past thoughts about ${username || 'this user'}. Use these as background context, but **prioritize the recent conversation above** when responding.\n\n${memoryContext}`;
+        systemPrompt += `\n\n${memoryContext}`;
       } else {
         // First interaction with this user
         const memoryTemplate = getMemorySystemTemplate({
@@ -620,7 +666,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
     if (boredomAction) {
       const boredomInstructions = getBoredomUpdateInstructions(boredomAction);
       if (boredomInstructions) {
-        systemPrompt += '\n\n## BOREDOM PING UPDATE\n\n' + boredomInstructions;
+        systemPrompt += `\n\n<boredom-update>\n${boredomInstructions}\n</boredom-update>`;
       }
     }
 
@@ -629,7 +675,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       console.log(`🎵 [MUSIC] Music context injection explicitly enabled for music query`);
       const musicContext = this.buildMusicContext();
       if (musicContext) {
-        systemPrompt += musicContext;
+        systemPrompt += `\n\n<music-context>\n${musicContext}\n</music-context>`;
       }
     }
 
@@ -710,7 +756,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
    * Placed at the end so it has the most impact after the conversation history
    */
   private buildReplyContextPrompt(replyContext: { isReply: boolean; isReplyToLumia?: boolean; originalContent?: string; originalTimestamp?: string; originalAuthor?: string }): string {
-    const isReplyToLumia = replyContext.isReplyToLumia !== false; // Default to true for backward compatibility
+    const isReplyToLumia = replyContext.isReplyToLumia === true; // Explicit check — undefined defaults to false (reply to other)
     const authorName = replyContext.originalAuthor || 'Unknown';
 
     const timestampText = replyContext.originalTimestamp ? `\n[Sent ${replyContext.originalTimestamp}]` : '';
@@ -767,6 +813,12 @@ The following are your past thoughts about ${username || 'this user'}. Use these
     // Build system prompt with user memory, guild context, and knowledge
     const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers, pageContents);
 
+    // Convert image URLs to base64 data URIs so external APIs can access them
+    let processedImages = images;
+    if (hasImages) {
+      processedImages = await this.processImageUrls(images!);
+    }
+
     // Process videos for models that support inline base64 video (Gemini 3 or OPENAI_VIDEO_ENABLED)
     let processedVideos: { uri: string; mimeType: string; inlineData: boolean }[] = [];
     if (hasVideos && (isGemini || config.openai.videoEnabled) && videoService.isAvailable()) {
@@ -792,9 +844,9 @@ The following are your past thoughts about ${username || 'this user'}. Use these
 
           // Use multimodal content with video support for Gemini or OpenAI-compatible video
           if ((isGemini || config.openai.videoEnabled) && processedVideos.length > 0) {
-            content = this.buildVideoMultimodalContent(m.content, images, processedVideos, isGemini);
+            content = this.buildVideoMultimodalContent(m.content, processedImages, processedVideos, isGemini);
           } else {
-            content = this.buildMultimodalContent(m.content, images);
+            content = this.buildMultimodalContent(m.content, processedImages);
           }
 
           // Prepend persona directive to the first text part
@@ -904,11 +956,12 @@ The following are your past thoughts about ${username || 'this user'}. Use these
 
       const getUserOpinionFunction = async (args: { username: string }) => {
         console.log(`💭 [AI MEMORY] Retrieving opinion about ${args.username}`);
-        
+
         try {
           const opinion = userMemoryService.getOpinionByUsername(args.username);
           if (opinion) {
-            return `Opinion about ${args.username}: ${opinion.opinion} (Sentiment: ${opinion.sentiment}, Last updated: ${opinion.updatedAt})`;
+            const pronounsLine = opinion.pronouns || PRONOUN_FALLBACK;
+            return `Opinion about ${args.username}:\nPronouns: ${pronounsLine}\nSentiment: ${opinion.sentiment}\nLast updated: ${opinion.updatedAt}\nOpinion: ${opinion.opinion}`;
           } else {
             return `You don't have any stored opinions about ${args.username} yet.`;
           }
@@ -1054,16 +1107,41 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       // Define user pronouns function
       const getUserPronounsFunction = async (args: { username: string }) => {
         console.log(`💭 [AI MEMORY] Retrieving pronouns for ${args.username}`);
-        
+
         try {
           const opinion = userMemoryService.getOpinionByUsername(args.username);
           if (opinion && opinion.pronouns) {
             return `${args.username}'s pronouns are: ${opinion.pronouns}`;
           }
-          return `I don't have pronouns stored for ${args.username}.`;
+          return `${args.username}: ${PRONOUN_FALLBACK}`;
         } catch (error) {
           console.error('💭 [AI MEMORY] Failed to retrieve pronouns:', error);
           return 'Error: Failed to retrieve pronouns.';
+        }
+      };
+
+      // Define search users function (fuzzy name matching)
+      const searchUsersFunction = async (args: { query: string; maxResults?: number }) => {
+        console.log(`💭 [AI MEMORY] Searching users matching "${args.query}"`);
+
+        try {
+          const results = userMemoryService.searchUsers(args.query, args.maxResults || 5);
+          if (results.length === 0) {
+            return `No users found matching "${args.query}".`;
+          }
+
+          let response = `Found ${results.length} user(s) matching "${args.query}":\n`;
+          results.forEach((r, i) => {
+            const pronounsLine = r.pronouns || PRONOUN_FALLBACK;
+            response += `\n${i + 1}. ${r.username} (ID: ${r.userId}) [Score: ${r.matchScore}/100]`;
+            response += `\n   Pronouns: ${pronounsLine}`;
+            response += `\n   Sentiment: ${r.sentiment}`;
+            response += `\n   Opinion: ${r.opinionSnippet}`;
+          });
+          return response;
+        } catch (error) {
+          console.error('💭 [AI MEMORY] Failed to search users:', error);
+          return 'Error: Failed to search users.';
         }
       };
 
@@ -1371,6 +1449,29 @@ The following are your past thoughts about ${username || 'this user'}. Use these
           {
             type: 'function',
             function: {
+              function: searchUsersFunction,
+              parse: JSON.parse,
+              description: 'Search for a user by partial or informal name. Use this to resolve a nickname/partial name to a Discord user ID (for pings with <@userId>), or to recall your opinions about someone when you only have a partial name. Returns matching users with their IDs, pronouns, sentiment, and opinion snippets.',
+              name: 'search_users',
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: {
+                    type: 'string',
+                    description: 'The partial name, nickname, or informal name to search for.',
+                  },
+                  maxResults: {
+                    type: 'number',
+                    description: 'Maximum number of results to return (default: 5).',
+                  },
+                },
+                required: ['query'],
+              },
+            },
+          },
+          {
+            type: 'function',
+            function: {
               function: storeThirdPartyContextFunction,
               parse: JSON.parse,
               description: 'Store information about what someone said about another person (gossip/social dynamics). Use this when you notice someone mentioning another user in conversation, especially if it reveals something interesting about their relationship or opinions.',
@@ -1567,16 +1668,12 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             runToolsParams.top_k = this.defaultTopK;
           }
 
-          // Disable reasoning for Gemini models to prevent leaks
-          if (isGemini) {
-            runToolsParams.thinking_config = {
-              thinking_level: 'MINIMAL' // MINIMAL, LOW, MEDIUM, HIGH
-            };
-          }
+          // Apply model-aware thinking configuration
+          this.applyThinkingConfig(runToolsParams, isGemini);
 
           // Add extra_body if configured (for custom provider parameters)
           if (this.extraBody) {
-            runToolsParams.extra_body = this.extraBody;
+            runToolsParams.extra_body = { ...runToolsParams.extra_body, ...this.extraBody };
           }
 
           // Add raw body params directly to request (not wrapped in extra_body)
@@ -1654,6 +1751,12 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       }
     }
 
+    // Convert image URLs to base64 data URIs so external APIs can access them
+    let processedImages = images;
+    if (hasImages) {
+      processedImages = await this.processImageUrls(images!);
+    }
+
     // Process videos for models that support inline base64 video (Gemini 3 or OPENAI_VIDEO_ENABLED)
     let processedVideos: { uri: string; mimeType: string; inlineData: boolean }[] = [];
     if (hasVideos && (isGemini || config.openai.videoEnabled) && videoService.isAvailable()) {
@@ -1692,9 +1795,9 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
           // Use multimodal content with video support for Gemini or OpenAI-compatible video
           if ((isGemini || config.openai.videoEnabled) && processedVideos.length > 0) {
-            content = this.buildVideoMultimodalContent(m.content, images, processedVideos, isGemini);
+            content = this.buildVideoMultimodalContent(m.content, processedImages, processedVideos, isGemini);
           } else {
-            content = this.buildMultimodalContent(m.content, images);
+            content = this.buildMultimodalContent(m.content, processedImages);
           }
 
           // Prepend persona directive to the first text part
@@ -1753,16 +1856,12 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
         streamParams.top_k = this.defaultTopK;
       }
 
-      // Disable reasoning for Gemini models to prevent leaks
-      if (isGemini) {
-        streamParams.thinking_config = {
-          thinking_level: 'MINIMAL' // MINIMAL, LOW, MEDIUM, HIGH
-        };
-      }
+      // Apply model-aware thinking configuration
+      this.applyThinkingConfig(streamParams, isGemini);
 
       // Add extra_body if configured (for custom provider parameters)
       if (this.extraBody) {
-        streamParams.extra_body = this.extraBody;
+        streamParams.extra_body = { ...streamParams.extra_body, ...this.extraBody };
       }
 
       // Add raw body params directly to request (not wrapped in extra_body)

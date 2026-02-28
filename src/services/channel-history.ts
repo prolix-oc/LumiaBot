@@ -135,13 +135,11 @@ export class ChannelHistoryService {
     }).join('\n');
 
     return `
-## Recent Channel Conversation Context
-
-Here's what has been happening in this channel recently:
+<channel-history>
+Recent messages in this channel. Multiple participants may be active — be aware of who is addressing whom.
 
 ${formatted}
-
-Remember: You're participating in an ongoing conversation. Reference the context naturally when relevant, but don't force it!
+</channel-history>
 `;
   }
 }

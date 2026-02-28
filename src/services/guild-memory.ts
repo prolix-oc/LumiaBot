@@ -197,13 +197,11 @@ export class GuildMemoryService {
       .join('\n');
 
     return `
-## Inside Jokes (Guild-Specific)
-
-These are the inside jokes and running gags specific to this server. Use them naturally when appropriate to make interactions feel more personal and connected to the community:
+<guild-context type="inside-jokes">
+Server-specific inside jokes. Reference naturally when they fit — don't force them.
 
 ${formattedJokes}
-
-Reference these jokes casually when they fit the conversation. Don't force them, but sprinkle them in when they make sense. The community has built these together!
+</guild-context>
 `;
   }
 

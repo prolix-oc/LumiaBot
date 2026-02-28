@@ -1,6 +1,128 @@
 import { Database } from 'bun:sqlite';
 import { config } from '../utils/config';
 
+export const PRONOUN_FALLBACK = 'No pronouns on record — use gender-neutral they/them when referring to this user.';
+
+export interface UserSearchResult {
+  userId: string;
+  username: string;
+  pronouns: string | null;
+  sentiment: string;
+  opinionSnippet: string;
+  matchScore: number;
+}
+
+/**
+ * Splits a username on _, -, whitespace, and camelCase/digit boundaries.
+ * "nanotech42" → ["nanotech", "42"]
+ * "nano_plays" → ["nano", "plays"]
+ * "NanoTech"   → ["nano", "tech"]
+ */
+function tokenize(s: string): string[] {
+  return s
+    .replace(/([a-z])([A-Z])/g, '$1 $2')   // camelCase → split
+    .replace(/([a-zA-Z])(\d)/g, '$1 $2')    // letter→digit boundary
+    .replace(/(\d)([a-zA-Z])/g, '$1 $2')    // digit→letter boundary
+    .split(/[_\-\s]+/)
+    .map(t => t.toLowerCase())
+    .filter(t => t.length > 0);
+}
+
+/**
+ * Standard Levenshtein edit distance, O(min(m,n)) space.
+ */
+function levenshteinDistance(a: string, b: string): number {
+  if (a.length > b.length) [a, b] = [b, a];
+  const m = a.length;
+  const n = b.length;
+  let prev = Array.from({ length: m + 1 }, (_, i) => i);
+  let curr = new Array(m + 1);
+
+  for (let j = 1; j <= n; j++) {
+    curr[0] = j;
+    for (let i = 1; i <= m; i++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[i] = Math.min(
+        prev[i]! + 1,       // deletion
+        curr[i - 1]! + 1,   // insertion
+        prev[i - 1]! + cost  // substitution
+      );
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[m]!;
+}
+
+/**
+ * Compute a fuzzy match score (0-100) between a search query and a candidate username.
+ *
+ * Tier 1: Exact match (case-insensitive)         → 100
+ * Tier 2: Query is prefix of candidate            → 70-100
+ * Tier 3: Query is substring of candidate         → 50-70
+ * Tier 4: Query matches a token exactly/prefix    → 60-75
+ * Tier 5: Multi-token query partial matches       → 40-65
+ * Tier 6: Edit distance similarity >= 60%         → 18-35
+ */
+function computeFuzzyScore(query: string, candidate: string): number {
+  const q = query.toLowerCase();
+  const c = candidate.toLowerCase();
+
+  // Tier 1: Exact match
+  if (q === c) return 100;
+
+  // Tier 2: Query is prefix
+  if (c.startsWith(q)) {
+    const ratio = q.length / c.length;
+    return 70 + Math.round(ratio * 30);
+  }
+
+  // Tier 3: Query is substring
+  if (c.includes(q)) {
+    const ratio = q.length / c.length;
+    return 50 + Math.round(ratio * 20);
+  }
+
+  // Tier 4 & 5: Token-based matching
+  const candidateTokens = tokenize(candidate);
+  const queryTokens = tokenize(query);
+
+  if (queryTokens.length === 1) {
+    // Tier 4: Single query token — check against each candidate token
+    for (const ct of candidateTokens) {
+      if (ct === q) return 75;
+      if (ct.startsWith(q)) {
+        const ratio = q.length / ct.length;
+        return 60 + Math.round(ratio * 15);
+      }
+    }
+  } else if (queryTokens.length > 1) {
+    // Tier 5: Multi-token — count how many query tokens match a candidate token
+    let matched = 0;
+    for (const qt of queryTokens) {
+      for (const ct of candidateTokens) {
+        if (ct === qt || ct.startsWith(qt)) {
+          matched++;
+          break;
+        }
+      }
+    }
+    if (matched > 0) {
+      const ratio = matched / queryTokens.length;
+      return 40 + Math.round(ratio * 25);
+    }
+  }
+
+  // Tier 6: Edit distance fallback
+  const dist = levenshteinDistance(q, c);
+  const maxLen = Math.max(q.length, c.length);
+  const similarity = 1 - dist / maxLen;
+  if (similarity >= 0.6) {
+    return 18 + Math.round(similarity * 17);
+  }
+
+  return 0;
+}
+
 export interface UserOpinion {
   id?: number;
   userId: string;
@@ -275,8 +397,7 @@ export class UserMemoryService {
     }
 
     let context = `
-## Your Memories About This User
-
+<user-memories>
 Username: ${opinion.username}
 Sentiment: ${opinion.sentiment}
 Your thoughts: ${opinion.opinion}
@@ -291,7 +412,8 @@ Your thoughts: ${opinion.opinion}
     }
 
     context += `
-Use these memories naturally in your response without explicitly mentioning that you're "recalling" anything.`;
+Use naturally — don't mention you're "recalling" anything.
+</user-memories>`;
 
     return context;
   }
@@ -334,8 +456,46 @@ Use these memories naturally in your response without explicitly mentioning that
     const result = this.db.query(
       'SELECT pronouns FROM user_opinions WHERE user_id = ?'
     ).get(userId) as { pronouns: string | null } | undefined;
-    
+
     return result?.pronouns || null;
+  }
+
+  /**
+   * Fuzzy-search users by partial/informal name.
+   * Full-scans user_opinions (typically < 1000 rows — instant) and scores each via computeFuzzyScore().
+   */
+  searchUsers(query: string, maxResults: number = 5): UserSearchResult[] {
+    const rows = this.db.query(
+      'SELECT user_id, username, pronouns, sentiment, opinion FROM user_opinions'
+    ).all() as Array<{
+      user_id: string;
+      username: string;
+      pronouns: string | null;
+      sentiment: string;
+      opinion: string;
+    }>;
+
+    const scored: UserSearchResult[] = [];
+
+    for (const row of rows) {
+      const score = computeFuzzyScore(query, row.username);
+      if (score > 0) {
+        scored.push({
+          userId: row.user_id,
+          username: row.username,
+          pronouns: row.pronouns,
+          sentiment: row.sentiment,
+          opinionSnippet: row.opinion.length > 150 ? row.opinion.slice(0, 150) + '...' : row.opinion,
+          matchScore: score,
+        });
+      }
+    }
+
+    scored.sort((a, b) => b.matchScore - a.matchScore);
+
+    const results = scored.slice(0, maxResults);
+    console.log(`💾 [USER MEMORY] Search for "${query}" returned ${results.length} results`);
+    return results;
   }
 }
 

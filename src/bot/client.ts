@@ -88,6 +88,9 @@ export class DiscordBot {
   private typingIntervals: Map<string, Timer>; // channelId -> timer
   private orchestrator?: LumiaBotIntegration;
   private orchestratorQueue: Map<string, { message: Message; replyContext: any; imageUrls: string[]; videoUrls: { url: string; mimeType?: string }[]; textAttachments: { name: string; content: string }[] }>; // eventId -> message info
+  private channelProcessingQueue: Map<string, Promise<void>>; // per-channel sequential processing
+  private processedMessageIds: Set<string>; // duplicate event guard
+  private processedMessageTimers: Map<string, Timer>; // TTL cleanup for processedMessageIds
 
   constructor() {
     this.client = new Client({
@@ -102,6 +105,9 @@ export class DiscordBot {
     this.commands = new Collection();
     this.typingIntervals = new Map();
     this.orchestratorQueue = new Map();
+    this.channelProcessingQueue = new Map();
+    this.processedMessageIds = new Set();
+    this.processedMessageTimers = new Map();
     this.setupEventHandlers();
     this.setupOrchestrator();
   }
@@ -241,10 +247,57 @@ export class DiscordBot {
       }
 
       // Build conversation history from context
-      const channelHistory = context.previousMessages
-        .filter(m => m.id !== lastMessage.id) // Exclude the current message
-        .map(m => `${m.isBot ? 'Bot' : 'User'} ${m.authorName}: ${m.content}`)
-        .join('\n');
+      let channelHistory: string;
+      const historyMessages = context.previousMessages.filter(m => m.id !== lastMessage.id);
+
+      if (context.isBanter && historyMessages.length > 0) {
+        // Banter/council mode: use structured XML tags with metadata
+        const messagesXml = context.previousMessages
+          .map(m => `<message speaker="${m.authorName}" role="${m.isBot ? 'bot' : 'user'}">${m.content}</message>`)
+          .join('\n');
+
+        const metadataLines: string[] = [];
+        metadataLines.push(`This is turn ${context.turnCount + 1} of ${context.maxTurns} in a multi-bot discussion.`);
+        if (context.replyingToBotName) {
+          metadataLines.push(`You are replying to ${context.replyingToBotName}'s message.`);
+        }
+        if (context.nearbyBots && context.nearbyBots.length > 0) {
+          const otherBotNames = context.nearbyBots
+            .filter(b => b.isOnline && b.botId !== context.respondingBotId)
+            .map(b => b.botName);
+          if (otherBotNames.length > 0) {
+            metadataLines.push(`Other bots present: ${otherBotNames.join(', ')}`);
+          }
+        }
+        if (context.turnCount >= context.maxTurns - 1) {
+          metadataLines.push(`This is your last turn — wrap up naturally.`);
+        }
+
+        channelHistory = `
+<council-discussion turn="${context.turnCount + 1}" max-turns="${context.maxTurns}">
+${metadataLines.join('\n')}
+
+<messages>
+${messagesXml}
+</messages>
+</council-discussion>
+`;
+      } else if (historyMessages.length > 0) {
+        // Non-banter orchestrated responses: use <channel-history> format
+        const formatted = historyMessages
+          .map(m => `${m.isBot ? 'Bot' : 'User'} ${m.authorName}: ${m.content}`)
+          .join('\n');
+
+        channelHistory = `
+<channel-history>
+Recent messages in this channel. Multiple participants may be active — be aware of who is addressing whom.
+
+${formatted}
+</channel-history>
+`;
+      } else {
+        channelHistory = '';
+      }
 
       // Create a working getUserListeningActivity callback using the guild
       // from the original Discord message, matching the non-orchestrator path.
@@ -268,6 +321,24 @@ export class DiscordBot {
         ? await pageExtractorService.extractPagesFromMessage(lastMessage.content)
         : [];
 
+      // In banter mode, set replyContext so the AI knows it's responding to a specific bot
+      const effectiveReplyContext = context.isBanter && context.replyingToBotName
+        ? {
+            isReply: true,
+            isReplyToLumia: false,
+            originalContent: historyMessages.length > 0 ? historyMessages[historyMessages.length - 1]!.content : undefined,
+            originalAuthor: context.replyingToBotName,
+          }
+        : replyContext
+          ? {
+              isReply: replyContext.isReply,
+              isReplyToLumia: replyContext.isReplyToLumia,
+              originalContent: replyContext.originalContent,
+              originalTimestamp: replyContext.originalTimestamp,
+              originalAuthor: replyContext.originalAuthor,
+            }
+          : undefined;
+
       // Generate response using the existing message handler
       const response = await handleMessage({
         content: lastMessage.content,
@@ -279,13 +350,7 @@ export class DiscordBot {
         username: lastMessage.authorName,
         guildId: message.guildId || 'dm',
         mentionedUsers,
-        replyContext: replyContext ? {
-          isReply: replyContext.isReply,
-          isReplyToLumia: replyContext.isReplyToLumia,
-          originalContent: replyContext.originalContent,
-          originalTimestamp: replyContext.originalTimestamp,
-          originalAuthor: replyContext.originalAuthor,
-        } : undefined,
+        replyContext: effectiveReplyContext,
         channelHistory: channelHistory || undefined,
         getUserListeningActivity,
         // Orchestrator follow-up support: allow the LLM to request another turn
@@ -298,10 +363,26 @@ export class DiscordBot {
       // Send the response directly to Discord
       if (response.text && response.text.trim()) {
         console.log(`[Orchestrator] Sending response to Discord for event ${eventId}`);
-        await message.reply({
-          content: response.text,
-          failIfNotExists: false,
-        });
+
+        let sentMessage;
+        if (context.replyToMessageId && 'send' in message.channel) {
+          // Reply to the previous bot's message for threaded conversation
+          sentMessage = await message.channel.send({
+            content: response.text,
+            reply: { messageReference: context.replyToMessageId, failIfNotExists: false },
+          });
+        } else {
+          // First turn: reply to the original user message
+          sentMessage = await message.reply({
+            content: response.text,
+            failIfNotExists: false,
+          });
+        }
+
+        // Store the Discord message ID so the orchestrator can thread the next bot's reply
+        if (sentMessage && this.orchestrator) {
+          this.orchestrator.setResponseMessageId(eventId, sentMessage.id);
+        }
       }
 
       return response.text;
@@ -518,6 +599,16 @@ export class DiscordBot {
       // Ignore empty messages
       if (!message.content.trim()) return;
 
+      // Duplicate event guard — Discord may deliver the same event twice
+      if (this.processedMessageIds.has(message.id)) return;
+      this.processedMessageIds.add(message.id);
+      // Auto-cleanup after 60s to prevent unbounded growth
+      const cleanupTimer = setTimeout(() => {
+        this.processedMessageIds.delete(message.id);
+        this.processedMessageTimers.delete(message.id);
+      }, 60_000);
+      this.processedMessageTimers.set(message.id, cleanupTimer);
+
       const botId = this.client.user?.id;
       if (!botId) return;
 
@@ -657,325 +748,365 @@ export class DiscordBot {
           return;
         }
 
-        // Check for boredom opt-in/opt-out intent (but let LLM respond naturally)
-        if (detectBoredomOptOut(message.content)) {
-          const guildId = message.guildId || 'dm';
-          boredomService.optOut(message.author.id, guildId);
-          boredomAction = 'opted-out';
-          console.log(`😴 [BOREDOM] User opted out - letting LLM respond naturally`);
-        } else if (detectBoredomOptIn(message.content)) {
-          const guildId = message.guildId || 'dm';
-          boredomService.optIn(message.author.id, guildId);
-          boredomAction = 'opted-in';
-          console.log(`😴 [BOREDOM] User opted in - letting LLM respond naturally`);
-        }
+        // Per-channel queue: serialize message processing within each channel
+        // so the bot's reply to message A is visible in channel history for message B.
+        // Different channels remain fully parallel.
+        const channelId = message.channelId;
+        const previousTask = this.channelProcessingQueue.get(channelId) ?? Promise.resolve();
 
-        // Check if channel supports typing indicator
-        const canType = (
-          message.channel instanceof TextChannel ||
-          message.channel instanceof ThreadChannel ||
-          message.channel instanceof NewsChannel ||
-          message.channel instanceof VoiceChannel ||
-          message.channel instanceof StageChannel ||
-          message.channel instanceof DMChannel
-        );
+        const currentTask = previousTask
+          .catch(() => {}) // don't let a previous failure break the chain
+          .then(() => this.processTriggeredMessage(message, botId, hasTrigger, replyContext, boredomAction));
 
-        // Start typing indicator for this specific channel
-        if (canType) {
-          this.startTyping(message.channel);
-        }
+        this.channelProcessingQueue.set(channelId, currentTask);
 
-        // Extract the actual message content (remove triggers if present)
-        const cleanedContent = hasTrigger ? extractMessageContent(message.content, botId) : message.content;
-        
-        // Don't respond if there's no actual content after removing triggers (only for explicit triggers)
-        if (hasTrigger && !cleanedContent.trim()) {
-          // Check if channel is still available (bot may have been kicked)
-          if (!message.channel) {
-            console.warn('⚠️ [CLIENT] Cannot reply - channel no longer available (bot may have been kicked)');
-            return;
+        // Clean up the map entry once this task settles, but only if it's still the latest
+        currentTask.finally(() => {
+          if (this.channelProcessingQueue.get(channelId) === currentTask) {
+            this.channelProcessingQueue.delete(channelId);
           }
-          await message.reply('You summoned me but forgot to say what you wanted! How can I help you?');
-          return;
-        }
+        });
+      }
+    });
+  }
 
-        try {
-          // Extract image and video URLs from attachments
-          const imageUrls: string[] = [];
-          const videoUrls: { url: string; mimeType?: string }[] = [];
-          const textAttachments: { name: string; content: string }[] = [];
-          
-          if (message.attachments.size > 0) {
-            for (const attachment of message.attachments.values()) {
-              if (attachment.contentType?.startsWith('image/gif')) {
-                videoUrls.push({
-                  url: attachment.url,
-                  mimeType: attachment.contentType,
-                });
-                console.log(`🎬 [CLIENT] GIF found in message (will convert to WebM): ${attachment.name} (${attachment.contentType})`);
-              } else if (attachment.contentType?.startsWith('image/')) {
-                imageUrls.push(attachment.url);
-                console.log(`🖼️  [CLIENT] Image found in message: ${attachment.name} (${attachment.contentType})`);
-              } else if (attachment.contentType?.startsWith('video/')) {
-                videoUrls.push({
-                  url: attachment.url,
-                  mimeType: attachment.contentType,
-                });
-                console.log(`🎥 [CLIENT] Video found in message: ${attachment.name} (${attachment.contentType})`);
-              } else if (attachment.contentType?.startsWith('text/') || 
-                        attachment.name.match(/\.(txt|md|json|csv|log|xml|yaml|yml|js|ts|jsx|tsx|py|rb|java|c|cpp|h|hpp|cs|go|rs|php|html|css|scss|sass|less|sql)$/i)) {
-                // Text file detected - check size and read content
-                const maxSizeBytes = config.attachments.maxTextFileSizeKB * 1024;
-                
-                // Check file size before downloading
-                if (attachment.size > maxSizeBytes) {
-                  console.log(`📄 [CLIENT] Text file too large: ${attachment.name} (${(attachment.size / 1024).toFixed(1)}KB > ${config.attachments.maxTextFileSizeKB}KB limit)`);
-                  textAttachments.push({
-                    name: attachment.name,
-                    content: `[File too large: ${(attachment.size / 1024).toFixed(1)}KB. Maximum size is ${config.attachments.maxTextFileSizeKB}KB]`,
-                  });
-                  continue;
-                }
-                
-                try {
-                  console.log(`📄 [CLIENT] Text file detected: ${attachment.name} (${attachment.contentType || 'unknown type'}, ${(attachment.size / 1024).toFixed(1)}KB)`);
-                  const response = await fetch(attachment.url);
-                  if (response.ok) {
-                    const textContent = await response.text();
-                    // Limit text content to prevent token overflow
-                    const maxChars = maxSizeBytes;
-                    const truncatedContent = textContent.length > maxChars 
-                      ? textContent.substring(0, maxChars) + '\n... [content truncated]' 
-                      : textContent;
-                    textAttachments.push({
-                      name: attachment.name,
-                      content: truncatedContent,
-                    });
-                    console.log(`📄 [CLIENT] Read text file: ${attachment.name} (${truncatedContent.length} chars)`);
-                  } else {
-                    console.warn(`⚠️ [CLIENT] Failed to fetch text file ${attachment.name}: ${response.status}`);
-                  }
-                } catch (error) {
-                  console.error(`❌ [CLIENT] Error reading text file ${attachment.name}:`, error);
-                }
-              }
-            }
-          }
+  /**
+   * Process a triggered message (extracted for per-channel queuing)
+   */
+  private async processTriggeredMessage(
+    message: Message,
+    botId: string,
+    hasTrigger: boolean,
+    replyContext: {
+      isReply: boolean;
+      isReplyToLumia: boolean;
+      originalContent?: string;
+      originalTimestamp?: string;
+      originalAuthor?: string;
+      embeddedContent?: {
+        images: string[];
+        videos: { url: string; mimeType?: string }[];
+      };
+    } | undefined,
+    boredomAction: 'opted-in' | 'opted-out' | undefined,
+  ): Promise<void> {
+    // Check for boredom opt-in/opt-out intent (but let LLM respond naturally)
+    if (detectBoredomOptOut(message.content)) {
+      const guildId = message.guildId || 'dm';
+      boredomService.optOut(message.author.id, guildId);
+      boredomAction = 'opted-out';
+      console.log(`😴 [BOREDOM] User opted out - letting LLM respond naturally`);
+    } else if (detectBoredomOptIn(message.content)) {
+      const guildId = message.guildId || 'dm';
+      boredomService.optIn(message.author.id, guildId);
+      boredomAction = 'opted-in';
+      console.log(`😴 [BOREDOM] User opted in - letting LLM respond naturally`);
+    }
 
-          // Identify URLs that will be scraped for page content, so we can skip their embed images
-          const scrapedUrls = config.pageExtraction.enabled
-            ? pageExtractorService.extractUrls(cleanedContent)
-            : [];
+    // Check if channel supports typing indicator
+    const canType = (
+      message.channel instanceof TextChannel ||
+      message.channel instanceof ThreadChannel ||
+      message.channel instanceof NewsChannel ||
+      message.channel instanceof VoiceChannel ||
+      message.channel instanceof StageChannel ||
+      message.channel instanceof DMChannel
+    );
 
-          // Helper: check if an embed's source URL matches any URL we're scraping
-          const isFromScrapedLink = (embedUrl: string | null): boolean => {
-            if (!embedUrl || scrapedUrls.length === 0) return false;
-            return scrapedUrls.some(scraped =>
-              embedUrl === scraped || embedUrl.startsWith(scraped) || scraped.startsWith(embedUrl)
-            );
-          };
+    // Start typing indicator for this specific channel
+    if (canType) {
+      this.startTyping(message.channel);
+    }
 
-          // Extract embeds from current message (forwarded messages, etc.)
-          if (message.embeds.length > 0) {
-            for (const embed of message.embeds) {
-              const embedType = embed.data?.type;
-              const isScrapedLink = isFromScrapedLink(embed.url);
+    // Extract the actual message content (remove triggers if present)
+    const cleanedContent = hasTrigger ? extractMessageContent(message.content, botId) : message.content;
 
-              if (isScrapedLink) {
-                console.log(`🌐 [CLIENT] Skipping embed for scraped URL: ${embed.url} (type: ${embedType})`);
-                continue;
-              }
+    // Don't respond if there's no actual content after removing triggers (only for explicit triggers)
+    if (hasTrigger && !cleanedContent.trim()) {
+      // Check if channel is still available (bot may have been kicked)
+      if (!message.channel) {
+        console.warn('⚠️ [CLIENT] Cannot reply - channel no longer available (bot may have been kicked)');
+        return;
+      }
+      await message.reply('You summoned me but forgot to say what you wanted! How can I help you?');
+      return;
+    }
 
-              if (embedType === 'gifv' && embed.video?.url) {
-                videoUrls.push({ url: embed.video.url, mimeType: 'image/gif' });
-                console.log(`🎬 [CLIENT] GIFV embed in message: ${embed.url || embed.video.url}`);
-              } else if (embedType === 'video' && embed.video?.url) {
-                videoUrls.push({ url: embed.video.proxyURL || embed.video.url, mimeType: 'video/mp4' });
-                console.log(`🎥 [CLIENT] Video embed in message: ${embed.url || embed.video.url}`);
-              } else if (embedType === 'image' && embed.image?.url) {
-                imageUrls.push(embed.image.proxyURL || embed.image.url);
-                console.log(`🖼️  [CLIENT] Image embed in message: ${embed.image.url}`);
-              } else if (embedType === 'rich' || embedType === 'article' || embedType === 'link') {
-                if (embed.image?.url) {
-                  imageUrls.push(embed.image.proxyURL || embed.image.url);
-                  console.log(`🖼️  [CLIENT] Rich embed image in message: ${embed.image.url}`);
-                }
-                if (embed.thumbnail?.url) {
-                  imageUrls.push(embed.thumbnail.proxyURL || embed.thumbnail.url);
-                  console.log(`🖼️  [CLIENT] Rich embed thumbnail in message: ${embed.thumbnail.url}`);
-                }
-              }
-            }
-          }
+    try {
+      // Extract image and video URLs from attachments
+      const imageUrls: string[] = [];
+      const videoUrls: { url: string; mimeType?: string }[] = [];
+      const textAttachments: { name: string; content: string }[] = [];
 
-          // Add embedded content from reply context
-          if (replyContext?.embeddedContent) {
-            imageUrls.push(...replyContext.embeddedContent.images);
-            videoUrls.push(...replyContext.embeddedContent.videos);
-          }
-
-          // Extract mentioned users for context parsing
-          const mentionedUsers = new Map<string, string>();
-          if (message.mentions.users.size > 0) {
-            message.mentions.users.forEach((user) => {
-              mentionedUsers.set(user.id, user.username);
-              console.log(`👥 [CLIENT] User mentioned: ${user.username} (${user.id})`);
+      if (message.attachments.size > 0) {
+        for (const attachment of message.attachments.values()) {
+          if (attachment.contentType?.startsWith('image/gif')) {
+            videoUrls.push({
+              url: attachment.url,
+              mimeType: attachment.contentType,
             });
-          }
+            console.log(`🎬 [CLIENT] GIF found in message (will convert to WebM): ${attachment.name} (${attachment.contentType})`);
+          } else if (attachment.contentType?.startsWith('image/')) {
+            imageUrls.push(attachment.url);
+            console.log(`🖼️  [CLIENT] Image found in message: ${attachment.name} (${attachment.contentType})`);
+          } else if (attachment.contentType?.startsWith('video/')) {
+            videoUrls.push({
+              url: attachment.url,
+              mimeType: attachment.contentType,
+            });
+            console.log(`🎥 [CLIENT] Video found in message: ${attachment.name} (${attachment.contentType})`);
+          } else if (attachment.contentType?.startsWith('text/') ||
+                    attachment.name.match(/\.(txt|md|json|csv|log|xml|yaml|yml|js|ts|jsx|tsx|py|rb|java|c|cpp|h|hpp|cs|go|rs|php|html|css|scss|sass|less|sql)$/i)) {
+            // Text file detected - check size and read content
+            const maxSizeBytes = config.attachments.maxTextFileSizeKB * 1024;
 
-          // Fetch recent channel history for context
-          let channelHistory: string | undefined;
-          if (canType) {
+            // Check file size before downloading
+            if (attachment.size > maxSizeBytes) {
+              console.log(`📄 [CLIENT] Text file too large: ${attachment.name} (${(attachment.size / 1024).toFixed(1)}KB > ${config.attachments.maxTextFileSizeKB}KB limit)`);
+              textAttachments.push({
+                name: attachment.name,
+                content: `[File too large: ${(attachment.size / 1024).toFixed(1)}KB. Maximum size is ${config.attachments.maxTextFileSizeKB}KB]`,
+              });
+              continue;
+            }
+
             try {
-              const channelMessages = await channelHistoryService.fetchChannelHistory(message.channel as TextChannel | ThreadChannel | NewsChannel | VoiceChannel | StageChannel | DMChannel, message.id);
-              channelHistory = channelHistoryService.formatHistoryForPrompt(channelMessages, message.author.id, this.client.user?.id, message.author.username);
-              if (channelHistory) {
-                console.log(`📜 [CLIENT] Added channel history context (${channelMessages.length} messages)`);
+              console.log(`📄 [CLIENT] Text file detected: ${attachment.name} (${attachment.contentType || 'unknown type'}, ${(attachment.size / 1024).toFixed(1)}KB)`);
+              const response = await fetch(attachment.url);
+              if (response.ok) {
+                const textContent = await response.text();
+                // Limit text content to prevent token overflow
+                const maxChars = maxSizeBytes;
+                const truncatedContent = textContent.length > maxChars
+                  ? textContent.substring(0, maxChars) + '\n... [content truncated]'
+                  : textContent;
+                textAttachments.push({
+                  name: attachment.name,
+                  content: truncatedContent,
+                });
+                console.log(`📄 [CLIENT] Read text file: ${attachment.name} (${truncatedContent.length} chars)`);
+              } else {
+                console.warn(`⚠️ [CLIENT] Failed to fetch text file ${attachment.name}: ${response.status}`);
               }
             } catch (error) {
-              console.warn('📜 [CLIENT] Failed to fetch channel history:', error);
+              console.error(`❌ [CLIENT] Error reading text file ${attachment.name}:`, error);
             }
-          }
-
-          // Create callback to check user's listening activity
-          const getUserListeningActivity = async (targetUserId: string) => {
-            try {
-              // Only check if we're in a guild
-              if (!message.guild) {
-                return null;
-              }
-              
-              // Fetch the member from the guild
-              const member = await message.guild.members.fetch({ 
-                user: targetUserId, 
-                withPresences: true 
-              });
-              
-              if (!member) {
-                return null;
-              }
-              
-              // Get their listening activity
-              return userActivityService.getMusicActivity(member);
-            } catch (error) {
-              console.error(`❌ [CLIENT] Failed to get listening activity for ${targetUserId}:`, error);
-              return null;
-            }
-          };
-
-          // Extract web page content from URLs in message
-          const pageContents = config.pageExtraction.enabled
-            ? await pageExtractorService.extractPagesFromMessage(cleanedContent)
-            : [];
-
-          // Generate response (search intent detected automatically via heuristics)
-          const response = await handleMessage({
-            content: cleanedContent,
-            imageUrls,
-            videoUrls,
-            textAttachments,
-            pageContents: pageContents.length > 0 ? pageContents : undefined,
-            userId: message.author.id,
-            username: message.author.username,
-            guildId: message.guildId || 'dm',
-            mentionedUsers,
-            replyContext: replyContext ? {
-              isReply: replyContext.isReply,
-              isReplyToLumia: replyContext.isReplyToLumia,
-              originalContent: replyContext.originalContent,
-              originalTimestamp: replyContext.originalTimestamp,
-              originalAuthor: replyContext.originalAuthor,
-            } : undefined,
-            boredomAction,
-            channelHistory,
-            getUserListeningActivity,
-          });
-
-          // Clear typing indicator before sending response
-          this.stopTyping(message.channelId);
-          
-          // Discord has a 2000 character limit for messages
-          const truncatedResponse = response.text.length > 1950 
-            ? response.text.slice(0, 1950) + '... (message truncated)' 
-            : response.text;
-
-          // Check if channel is still available before sending (bot may have been kicked)
-          if (!message.channel) {
-            console.warn('⚠️ [CLIENT] Cannot send message - channel no longer available (bot may have been kicked)');
-            return;
-          }
-
-          // Send the text response
-          // Use failIfNotExists: false to handle cases where the message being replied to
-          // is a forwarded message or has been deleted
-          let sentMessage;
-          try {
-            sentMessage = await message.reply({
-              content: truncatedResponse,
-              failIfNotExists: false,
-            });
-          } catch (replyError) {
-            // If reply fails (e.g., unknown message reference), send as regular message
-            console.warn('⚠️ [CLIENT] Reply failed, sending as regular message:', replyError);
-            const { TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel } = await import('discord.js');
-            if (message.channel instanceof TextChannel ||
-                message.channel instanceof ThreadChannel ||
-                message.channel instanceof NewsChannel ||
-                message.channel instanceof VoiceChannel ||
-                message.channel instanceof StageChannel ||
-                message.channel instanceof DMChannel) {
-              sentMessage = await message.channel.send({
-                content: `${message.author} ${truncatedResponse}`,
-              });
-            } else {
-              throw replyError;
-            }
-          }
-          
-          // Add reactions if any were specified
-          if (response.reactions.length > 0) {
-            for (const emoji of response.reactions) {
-              try {
-                await message.react(emoji);
-                console.log(`😀 [CLIENT] Added reaction: ${emoji}`);
-              } catch (reactError) {
-                console.error(`❌ [CLIENT] Failed to add reaction "${emoji}":`, reactError);
-              }
-            }
-          }
-
-          // Record this interaction for boredom system
-          const guildId = message.guildId || 'dm';
-          const channelId = message.channelId;
-          
-          boredomService.recordInteraction(
-            message.author.id,
-            guildId,
-            message.author.username,
-            channelId,
-            (userId, guildId, username, channelId) => {
-              // This callback is called when boredom timer fires
-              this.sendBoredomPing(userId, guildId, channelId);
-            }
-          );
-
-        } catch (error) {
-          // Clear typing indicator on error too
-          this.stopTyping(message.channelId);
-          console.error('Message response error:', error);
-          // Check if channel is still available before trying to send error message
-          if (!message.channel) {
-            console.warn('⚠️ [CLIENT] Cannot send error message - channel no longer available (bot may have been kicked)');
-            return;
-          }
-          try {
-            await message.reply(getErrorMessage('generic_error'));
-          } catch (replyError) {
-            console.error('❌ [CLIENT] Failed to send error reply:', replyError);
           }
         }
       }
-    });
+
+      // Identify URLs that will be scraped for page content, so we can skip their embed images
+      const scrapedUrls = config.pageExtraction.enabled
+        ? pageExtractorService.extractUrls(cleanedContent)
+        : [];
+
+      // Helper: check if an embed's source URL matches any URL we're scraping
+      const isFromScrapedLink = (embedUrl: string | null): boolean => {
+        if (!embedUrl || scrapedUrls.length === 0) return false;
+        return scrapedUrls.some(scraped =>
+          embedUrl === scraped || embedUrl.startsWith(scraped) || scraped.startsWith(embedUrl)
+        );
+      };
+
+      // Extract embeds from current message (forwarded messages, etc.)
+      if (message.embeds.length > 0) {
+        for (const embed of message.embeds) {
+          const embedType = embed.data?.type;
+          const isScrapedLink = isFromScrapedLink(embed.url);
+
+          if (isScrapedLink) {
+            console.log(`🌐 [CLIENT] Skipping embed for scraped URL: ${embed.url} (type: ${embedType})`);
+            continue;
+          }
+
+          if (embedType === 'gifv' && embed.video?.url) {
+            videoUrls.push({ url: embed.video.url, mimeType: 'image/gif' });
+            console.log(`🎬 [CLIENT] GIFV embed in message: ${embed.url || embed.video.url}`);
+          } else if (embedType === 'video' && embed.video?.url) {
+            videoUrls.push({ url: embed.video.proxyURL || embed.video.url, mimeType: 'video/mp4' });
+            console.log(`🎥 [CLIENT] Video embed in message: ${embed.url || embed.video.url}`);
+          } else if (embedType === 'image' && embed.image?.url) {
+            imageUrls.push(embed.image.proxyURL || embed.image.url);
+            console.log(`🖼️  [CLIENT] Image embed in message: ${embed.image.url}`);
+          } else if (embedType === 'rich' || embedType === 'article' || embedType === 'link') {
+            if (embed.image?.url) {
+              imageUrls.push(embed.image.proxyURL || embed.image.url);
+              console.log(`🖼️  [CLIENT] Rich embed image in message: ${embed.image.url}`);
+            }
+            if (embed.thumbnail?.url) {
+              imageUrls.push(embed.thumbnail.proxyURL || embed.thumbnail.url);
+              console.log(`🖼️  [CLIENT] Rich embed thumbnail in message: ${embed.thumbnail.url}`);
+            }
+          }
+        }
+      }
+
+      // Add embedded content from reply context
+      if (replyContext?.embeddedContent) {
+        imageUrls.push(...replyContext.embeddedContent.images);
+        videoUrls.push(...replyContext.embeddedContent.videos);
+      }
+
+      // Extract mentioned users for context parsing
+      const mentionedUsers = new Map<string, string>();
+      if (message.mentions.users.size > 0) {
+        message.mentions.users.forEach((user) => {
+          mentionedUsers.set(user.id, user.username);
+          console.log(`👥 [CLIENT] User mentioned: ${user.username} (${user.id})`);
+        });
+      }
+
+      // Fetch recent channel history for context
+      let channelHistory: string | undefined;
+      if (canType) {
+        try {
+          const channelMessages = await channelHistoryService.fetchChannelHistory(message.channel as TextChannel | ThreadChannel | NewsChannel | VoiceChannel | StageChannel | DMChannel, message.id);
+          channelHistory = channelHistoryService.formatHistoryForPrompt(channelMessages, message.author.id, this.client.user?.id, message.author.username);
+          if (channelHistory) {
+            console.log(`📜 [CLIENT] Added channel history context (${channelMessages.length} messages)`);
+          }
+        } catch (error) {
+          console.warn('📜 [CLIENT] Failed to fetch channel history:', error);
+        }
+      }
+
+      // Create callback to check user's listening activity
+      const getUserListeningActivity = async (targetUserId: string) => {
+        try {
+          // Only check if we're in a guild
+          if (!message.guild) {
+            return null;
+          }
+
+          // Fetch the member from the guild
+          const member = await message.guild.members.fetch({
+            user: targetUserId,
+            withPresences: true
+          });
+
+          if (!member) {
+            return null;
+          }
+
+          // Get their listening activity
+          return userActivityService.getMusicActivity(member);
+        } catch (error) {
+          console.error(`❌ [CLIENT] Failed to get listening activity for ${targetUserId}:`, error);
+          return null;
+        }
+      };
+
+      // Extract web page content from URLs in message
+      const pageContents = config.pageExtraction.enabled
+        ? await pageExtractorService.extractPagesFromMessage(cleanedContent)
+        : [];
+
+      // Generate response (search intent detected automatically via heuristics)
+      const response = await handleMessage({
+        content: cleanedContent,
+        imageUrls,
+        videoUrls,
+        textAttachments,
+        pageContents: pageContents.length > 0 ? pageContents : undefined,
+        userId: message.author.id,
+        username: message.author.username,
+        guildId: message.guildId || 'dm',
+        mentionedUsers,
+        replyContext: replyContext ? {
+          isReply: replyContext.isReply,
+          isReplyToLumia: replyContext.isReplyToLumia,
+          originalContent: replyContext.originalContent,
+          originalTimestamp: replyContext.originalTimestamp,
+          originalAuthor: replyContext.originalAuthor,
+        } : undefined,
+        boredomAction,
+        channelHistory,
+        getUserListeningActivity,
+      });
+
+      // Clear typing indicator before sending response
+      this.stopTyping(message.channelId);
+
+      // Discord has a 2000 character limit for messages
+      const truncatedResponse = response.text.length > 1950
+        ? response.text.slice(0, 1950) + '... (message truncated)'
+        : response.text;
+
+      // Check if channel is still available before sending (bot may have been kicked)
+      if (!message.channel) {
+        console.warn('⚠️ [CLIENT] Cannot send message - channel no longer available (bot may have been kicked)');
+        return;
+      }
+
+      // Send the text response
+      // Use failIfNotExists: false to handle cases where the message being replied to
+      // is a forwarded message or has been deleted
+      let sentMessage;
+      try {
+        sentMessage = await message.reply({
+          content: truncatedResponse,
+          failIfNotExists: false,
+        });
+      } catch (replyError) {
+        // If reply fails (e.g., unknown message reference), send as regular message
+        console.warn('⚠️ [CLIENT] Reply failed, sending as regular message:', replyError);
+        const { TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel } = await import('discord.js');
+        if (message.channel instanceof TextChannel ||
+            message.channel instanceof ThreadChannel ||
+            message.channel instanceof NewsChannel ||
+            message.channel instanceof VoiceChannel ||
+            message.channel instanceof StageChannel ||
+            message.channel instanceof DMChannel) {
+          sentMessage = await message.channel.send({
+            content: `${message.author} ${truncatedResponse}`,
+          });
+        } else {
+          throw replyError;
+        }
+      }
+
+      // Add reactions if any were specified
+      if (response.reactions.length > 0) {
+        for (const emoji of response.reactions) {
+          try {
+            await message.react(emoji);
+            console.log(`😀 [CLIENT] Added reaction: ${emoji}`);
+          } catch (reactError) {
+            console.error(`❌ [CLIENT] Failed to add reaction "${emoji}":`, reactError);
+          }
+        }
+      }
+
+      // Record this interaction for boredom system
+      const guildId = message.guildId || 'dm';
+      const channelId = message.channelId;
+
+      boredomService.recordInteraction(
+        message.author.id,
+        guildId,
+        message.author.username,
+        channelId,
+        (userId, guildId, username, channelId) => {
+          // This callback is called when boredom timer fires
+          this.sendBoredomPing(userId, guildId, channelId);
+        }
+      );
+
+    } catch (error) {
+      // Clear typing indicator on error too
+      this.stopTyping(message.channelId);
+      console.error('Message response error:', error);
+      // Check if channel is still available before trying to send error message
+      if (!message.channel) {
+        console.warn('⚠️ [CLIENT] Cannot send error message - channel no longer available (bot may have been kicked)');
+        return;
+      }
+      try {
+        await message.reply(getErrorMessage('generic_error'));
+      } catch (replyError) {
+        console.error('❌ [CLIENT] Failed to send error reply:', replyError);
+      }
+    }
   }
 
   /**

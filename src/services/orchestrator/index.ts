@@ -30,6 +30,7 @@ export class LumiaBotIntegration {
   private responseReadyCallback: ((eventId: string, response: string) => void) | null = null;
   private typingCallback: TypingCallback | null = null;
   private pendingFollowUps: Map<string, { resolve: (result: FollowUpAckPayload) => void; timeout: ReturnType<typeof setTimeout> }> = new Map();
+  private responseMessageIds: Map<string, string> = new Map(); // eventId -> Discord message ID
 
   constructor(config: LumiaBotConfig) {
     this.config = {
@@ -329,9 +330,15 @@ export class LumiaBotIntegration {
         this.typingCallback(payload.channelId, payload.guildId, false);
       }
       
+      // Retrieve the Discord message ID set by client.ts after sending to Discord
+      const discordMessageId = this.responseMessageIds.get(payload.eventId);
+      if (discordMessageId) {
+        this.responseMessageIds.delete(payload.eventId);
+      }
+
       // Send the response back to the orchestrator
-      this.sendResponseComplete(payload.turnId, response);
-      
+      this.sendResponseComplete(payload.turnId, response, discordMessageId);
+
       // Notify client that response is ready
       if (this.responseReadyCallback) {
         console.log(`[Orchestrator] Notifying client that response is ready for event ${payload.eventId}`);
@@ -363,11 +370,16 @@ export class LumiaBotIntegration {
     this.typingCallback = callback;
   }
 
-  private sendResponseComplete(turnId: string, responseContent: string): void {
+  setResponseMessageId(eventId: string, messageId: string): void {
+    this.responseMessageIds.set(eventId, messageId);
+  }
+
+  private sendResponseComplete(turnId: string, responseContent: string, responseMessageId?: string): void {
     const payload: ResponseCompletePayload = {
       turnId,
       botId: this.config.botId,
       responseContent,
+      responseMessageId,
     };
 
     this.sendMessage({

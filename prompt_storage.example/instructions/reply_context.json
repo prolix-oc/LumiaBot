@@ -1,6 +1,5 @@
 {
-  "description": "Response templates for reply contexts",
-  "default_reply": "{authorName} said: {originalContent}",
-  "thread_continuation": "Continuing the conversation with {authorName}...",
-  "mention_context": "Responding to {authorName}'s message..."
+  "reply_to_bot": "\n\n<reply-context type=\"direct\">\n\nThe user just REPLIED to your previous message below.\n\n### The message they are responding to:\n{originalContent}{timestamp}\n\n### How to respond:\n- Directly address what they said in response to YOUR message above\n- Reference specific points from your previous message\n- Continue the conversation thread naturally\n- DO NOT treat this as a brand new conversation topic\n\nRemember: They clicked Reply on your message, so they want to continue THAT specific conversation thread!\n\n</reply-context>",
+
+  "reply_to_other": "\n\n<reply-context type=\"third-party\">\n\nThe user is replying to **{authorName}**'s message (NOT yours). They mentioned you to pull you into the conversation.\n\n### The message they are responding to:\nAuthor: {authorName}\n{originalContent}{timestamp}\n\n### How to respond:\n- This message is NOT about you and is NOT directed at you — the user is discussing {authorName}'s message\n- {authorName} is a real person/entity in this channel who said the message shown above\n- The user wants your reaction, opinion, or involvement regarding what {authorName} said\n- Do NOT confuse yourself with {authorName} — you are a separate entity\n- Do NOT act confused about who {authorName} is — they exist in this conversation\n- Reference {authorName} by name and engage with the context naturally\n\n</reply-context>"
 }

@@ -86,6 +86,9 @@ export const config = {
     maxContentLength: parseInt(process.env.PAGE_EXTRACTION_MAX_CONTENT_KB || '50') * 1024,
     timeoutMs: parseInt(process.env.PAGE_EXTRACTION_TIMEOUT_MS || '10000'),
   },
+  thinking: {
+    enabled: process.env.THINKING_ENABLED !== 'false', // default: true
+  },
   orchestrator: {
     // Optional: Enable orchestrator integration for multi-bot coordination
     enabled: process.env.ORCHESTRATOR_ENABLED === 'true',
@@ -107,6 +110,36 @@ export const config = {
 export function isGemini3Model(): boolean {
   const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
   return model.includes('gemini-3') || model.includes('gemini3');
+}
+
+export function isDeepSeekModel(): boolean {
+  const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
+  return model.includes('deepseek');
+}
+
+export function isMoonshotThinkingModel(): boolean {
+  const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
+  return (model.includes('kimi') || model.includes('moonshot')) && model.includes('thinking');
+}
+
+export function isOpenRouterProvider(): boolean {
+  return (config.openai.baseUrl || '').toLowerCase().includes('openrouter');
+}
+
+export function isGLMModel(): boolean {
+  const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
+  return model.includes('glm');
+}
+
+export function isGeminiFlashModel(): boolean {
+  const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
+  return (model.includes('gemini-3') || model.includes('gemini3')) && model.includes('flash');
+}
+
+export function isGeminiProModel(): boolean {
+  const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
+  if (!model.includes('gemini-3') && !model.includes('gemini3')) return false;
+  return model.includes('pro') || (!model.includes('flash') && !model.includes('nano'));
 }
 
 export function validateConfig(): void {

@@ -1,8 +1,8 @@
 import { GoogleGenAI, type GenerateContentConfig, type Content, type FunctionDeclaration, Type, HarmCategory, HarmBlockThreshold, FunctionCallingConfigMode } from '@google/genai';
-import { config } from '../utils/config';
+import { config, isGeminiFlashModel, isGeminiProModel } from '../utils/config';
 import { getBotDefinition } from '../utils/bot-definition';
 import { searxngService } from './searxng';
-import { userMemoryService } from './user-memory';
+import { userMemoryService, PRONOUN_FALLBACK } from './user-memory';
 import { knowledgeGraphService } from './knowledge-graph';
 import { musicService } from './music';
 import { videoService } from './video';
@@ -305,13 +305,13 @@ export class GoogleGenAIService {
       timeZoneName: 'short'
     });
     
-    let systemPrompt = `╔════════════════════════════════════════════════════════════════╗
-║  📅 CURRENT DATE & TIME                                         ║
-╚════════════════════════════════════════════════════════════════╝
-
+    let systemPrompt = `<datetime>
 Today is ${currentDateTime}.
+</datetime>
 
-${getBotDefinition()}`;
+<identity>
+${getBotDefinition()}
+</identity>`;
     
     // Get last message content for music detection
     const messages = options.messages;
@@ -319,57 +319,37 @@ ${getBotDefinition()}`;
     
     // PRIORITY 1: Add explicit current user identification
     if (username) {
-      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
-║  👤 CURRENT USER CONTEXT                                        ║
-╚════════════════════════════════════════════════════════════════╝
-
-You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
-
-⚠️  CRITICAL - USER IDENTIFICATION RULES:
-1. **MESSAGE AUTHOR:** The current message was sent by the user shown above - always address THEM, not others
-2. **MENTIONED USERS:** Users explicitly pinged/mentioned in the current message${mentionedUsers && mentionedUsers.size > 0 ? ' (see below)' : ''} - if responding TO or ABOUT them, use THEIR name
-3. **CONVERSATION HISTORY:** Other users mentioned in previous messages below - they are NOT the current author unless explicitly stated
-
-❌ NEVER confuse the current author with users mentioned in conversation history
-✅ If the current author says "Hey @OtherUser", they are talking TO OtherUser, not AS OtherUser`;
-
-      // Get and display pronouns prominently
-      if (userId) {
-        const pronouns = userMemoryService.getPronouns(userId);
-        if (pronouns) {
-          systemPrompt += `\n\n📋 **Pronouns:** ${pronouns}\n✅ **ALWAYS use these pronouns when referring to the current user**`;
-        } else {
-          systemPrompt += `\n\n📋 **Pronouns:** Not specified yet. If the current user mentions their pronouns, make sure to note them!`;
-        }
-      }
+      const pronouns = userId ? userMemoryService.getPronouns(userId) : null;
+      const pronounsAttr = pronouns ? ` pronouns="${pronouns}"` : '';
+      systemPrompt += `\n\n<current-user name="${username}"${userId ? ` id="${userId}"` : ''}${pronounsAttr}>
+The current message author. Address THEM — not users from conversation history.
+If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
       // Add explicitly mentioned users section if present
       if (mentionedUsers && mentionedUsers.size > 0) {
-        systemPrompt += `\n\n👥 **USERS MENTIONED IN THIS MESSAGE:**\n`;
+        systemPrompt += `\n\n<mentioned-users>`;
         mentionedUsers.forEach((name, id) => {
           if (id !== userId) { // Don't list the author as a mention
-            systemPrompt += `• ${name} (ID: ${id})\n`;
+            systemPrompt += `\n- ${name} (ID: ${id})`;
           }
         });
-        systemPrompt += `\n⚠️ These users were explicitly pinged by the current author. If they are asking you to interact with or respond to one of them, use the MENTIONED user's name, not the current user's.`;
+        systemPrompt += `\n</mentioned-users>`;
       }
 
-      systemPrompt += '\n';
+      systemPrompt += '\n</current-user>\n';
     }
     
     // PRIORITY 2: Add video-specific instructions if videos are present
     if (hasVideos) {
       const videoInstructions = getVideoReactionInstructions();
       if (videoInstructions) {
-        systemPrompt += '\n\n' + videoInstructions;
+        systemPrompt += `\n\n<video-instructions>\n${videoInstructions}\n</video-instructions>`;
       }
     }
-    
+
     // PRIORITY 3: Conversation history context
-    // The full conversation history (with username attribution) is already in the API messages array.
-    // A brief note here helps the AI connect the dots without duplicating context at different fidelity levels.
     if (userId && guildId) {
-      systemPrompt += `\n\n## Conversation History\n\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].`;
+      systemPrompt += `\n\n<conversation-history-note>\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].\n</conversation-history-note>`;
     }
 
     // PRIORITY 4: Add recent channel conversation history
@@ -384,22 +364,20 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
     
     // Add text file attachments if present
     if (textAttachments && textAttachments.length > 0) {
-      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
-║  📎 ATTACHED FILES                                              ║
-╚════════════════════════════════════════════════════════════════╝\n`;
+      systemPrompt += `\n\n<attached-files>`;
       for (const attachment of textAttachments) {
-        systemPrompt += `\n--- File: ${attachment.name} ---\n${attachment.content}\n--- End of ${attachment.name} ---\n`;
+        systemPrompt += `\n<file name="${attachment.name}">\n${attachment.content}\n</file>`;
       }
+      systemPrompt += `\n</attached-files>`;
     }
 
     // Add extracted web page contents if present
     if (pageContents && pageContents.length > 0) {
-      systemPrompt += `\n\n╔════════════════════════════════════════════════════════════════╗
-║  🌐 EXTRACTED WEB PAGES                                        ║
-╚════════════════════════════════════════════════════════════════╝\n`;
+      systemPrompt += `\n\n<web-pages>`;
       for (const page of pageContents) {
-        systemPrompt += `\n--- Page: ${page.title} (${page.url}) ---\n${page.content}\n--- End of page ---\n`;
+        systemPrompt += `\n<page title="${page.title}" url="${page.url}">\n${page.content}\n</page>`;
       }
+      systemPrompt += `\n</web-pages>`;
     }
 
     // Add guild-specific context if available
@@ -424,9 +402,7 @@ You are currently talking to: **${username}**${userId ? ` (ID: ${userId})` : ''}
       const memoryContext = userMemoryService.getOpinionContext(userId);
       
       if (memoryContext) {
-        systemPrompt += `\n\n## 📚 STORED MEMORIES (Reference Only)
-
-The following are your past thoughts about ${username || 'this user'}. Use these as background context, but **prioritize the recent conversation above** when responding.\n\n${memoryContext}`;
+        systemPrompt += `\n\n${memoryContext}`;
       } else {
         // First interaction with this user
         const memoryTemplate = getMemorySystemTemplate({
@@ -441,7 +417,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
     if (boredomAction) {
       const boredomInstructions = getBoredomUpdateInstructions(boredomAction);
       if (boredomInstructions) {
-        systemPrompt += '\n\n## BOREDOM PING UPDATE\n\n' + boredomInstructions;
+        systemPrompt += `\n\n<boredom-update>\n${boredomInstructions}\n</boredom-update>`;
       }
     }
 
@@ -450,7 +426,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
       console.log(`🎵 [Google GenAI] Music context injection explicitly enabled for music query`);
       const musicContext = this.buildMusicContext();
       if (musicContext) {
-        systemPrompt += musicContext;
+        systemPrompt += `\n\n<music-context>\n${musicContext}\n</music-context>`;
       }
     }
 
@@ -518,7 +494,7 @@ The following are your past thoughts about ${username || 'this user'}. Use these
    * Build the reply context prompt with strong emphasis
    */
   private buildReplyContextPrompt(replyContext: { isReply: boolean; isReplyToLumia?: boolean; originalContent?: string; originalTimestamp?: string; originalAuthor?: string }): string {
-    const isReplyToLumia = replyContext.isReplyToLumia !== false; // Default to true for backward compatibility
+    const isReplyToLumia = replyContext.isReplyToLumia === true; // Explicit check — undefined defaults to false (reply to other)
     const authorName = replyContext.originalAuthor || 'Unknown';
     const timestampText = replyContext.originalTimestamp ? `\n[Sent ${replyContext.originalTimestamp}]` : '';
 
@@ -724,6 +700,25 @@ The following are your past thoughts about ${username || 'this user'}. Use these
           required: ['mentionedUserId', 'mentionedUsername', 'mentionedByUserId', 'mentionedByUsername', 'context'],
         },
       });
+
+      tools.push({
+        name: 'search_users',
+        description: 'Search for a user by partial or informal name. Use this to resolve a nickname/partial name to a Discord user ID (for pings with <@userId>), or to recall your opinions about someone when you only have a partial name. Returns matching users with their IDs, pronouns, sentiment, and opinion snippets.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: 'The partial name, nickname, or informal name to search for.',
+            },
+            maxResults: {
+              type: Type.NUMBER,
+              description: 'Maximum number of results to return (default: 5).',
+            },
+          },
+          required: ['query'],
+        },
+      });
     }
 
     // Conversation history management tools
@@ -882,7 +877,8 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
         case 'get_user_opinion': {
           const opinion = userMemoryService.getOpinionByUsername(args.username);
           if (opinion) {
-            return `Opinion about ${args.username}: ${opinion.opinion} (Sentiment: ${opinion.sentiment}, Last updated: ${opinion.updatedAt})`;
+            const pronounsLine = opinion.pronouns || PRONOUN_FALLBACK;
+            return `Opinion about ${args.username}:\nPronouns: ${pronounsLine}\nSentiment: ${opinion.sentiment}\nLast updated: ${opinion.updatedAt}\nOpinion: ${opinion.opinion}`;
           }
           return `You don't have any stored opinions about ${args.username} yet.`;
         }
@@ -982,7 +978,24 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           if (opinion && opinion.pronouns) {
             return `${args.username}'s pronouns are: ${opinion.pronouns}`;
           }
-          return `I don't have pronouns stored for ${args.username}.`;
+          return `${args.username}: ${PRONOUN_FALLBACK}`;
+        }
+
+        case 'search_users': {
+          const results = userMemoryService.searchUsers(args.query, args.maxResults || 5);
+          if (results.length === 0) {
+            return `No users found matching "${args.query}".`;
+          }
+          let searchResponse = `Found ${results.length} user(s) matching "${args.query}":\n`;
+          results.forEach((r: any, i: number) => {
+            const pronounsLine = r.pronouns || PRONOUN_FALLBACK;
+            searchResponse += `\n${i + 1}. ${r.username} (ID: ${r.userId}) [Score: ${r.matchScore}/100]`;
+            searchResponse += `\n   Pronouns: ${pronounsLine}`;
+            searchResponse += `\n   Sentiment: ${r.sentiment}`;
+            searchResponse += `\n   Opinion: ${r.opinionSnippet}`;
+          });
+          console.log(`🔧 [Google GenAI] User search for "${args.query}" returned ${results.length} results`);
+          return searchResponse;
         }
 
         case 'store_third_party_context': {
@@ -1104,11 +1117,15 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       topP: this.defaultTopP,
       topK: this.defaultTopK > 0 ? this.defaultTopK : undefined,
       maxOutputTokens: options.maxTokens ?? this.defaultMaxTokens,
-      // Natively disable thinking/reasoning output at the API level
-      // This is more efficient than post-processing filtering
+      // Configure thinking level based on model capability and user preference
       thinkingConfig: {
         includeThoughts: false,
-        thinkingLevel: 'LOW' as any,  // API only supports 'low' or 'high'
+        thinkingLevel: (() => {
+          if (!config.thinking.enabled) return 'LOW' as any;
+          if (isGeminiProModel()) return 'HIGH' as any;
+          if (isGeminiFlashModel()) return 'MEDIUM' as any;
+          return 'LOW' as any;
+        })(),
       },
       // Disable all content safety filters
       // BLOCK_NONE allows all content without blocking
@@ -1138,15 +1155,31 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     const tools = this.buildTools(options);
     if (tools) {
       genConfig.tools = [{ functionDeclarations: tools }];
-      // Force model to only use our custom tools, disable native Google search
-      genConfig.toolConfig = {
-        functionCallingConfig: {
-          mode: FunctionCallingConfigMode.ANY,
-          allowedFunctionNames: tools.map(t => t.name).filter((name): name is string => name !== undefined),
-        },
-      };
-      console.log(`🔧 [Google GenAI] Enabled ${tools.length} tool(s): ${tools.map(t => t.name).join(', ')}`);
+      const toolNames = tools.map(t => t.name).filter((name): name is string => name !== undefined);
+      // When thinking is enabled, use AUTO mode (required for thinking compatibility)
+      // When thinking is disabled, use ANY mode to force tool calls
+      if (config.thinking.enabled) {
+        genConfig.toolConfig = {
+          functionCallingConfig: {
+            mode: FunctionCallingConfigMode.AUTO,
+          },
+        };
+        console.log(`🔧 [Google GenAI] Enabled ${tools.length} tool(s) in AUTO mode (thinking enabled): ${toolNames.join(', ')}`);
+      } else {
+        genConfig.toolConfig = {
+          functionCallingConfig: {
+            mode: FunctionCallingConfigMode.ANY,
+            allowedFunctionNames: toolNames,
+          },
+        };
+        console.log(`🔧 [Google GenAI] Enabled ${tools.length} tool(s) in ANY mode (forced): ${toolNames.join(', ')}`);
+      }
       console.log(`🔧 [Google GenAI] Disabled native Google search - using SearXNG only`);
+    }
+
+    if (config.thinking.enabled) {
+      const level = genConfig.thinkingConfig?.thinkingLevel || 'LOW';
+      console.log(`🧠 [Google GenAI] Thinking enabled at level: ${level}`);
     }
 
     return genConfig;
@@ -1241,11 +1274,17 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           config: currentConfig,
         });
 
-        // Check for function calls
-        const functionCalls = response.functionCalls;
-        if (functionCalls && functionCalls.length > 0) {
-          console.log(`🔧 [Google GenAI] Model requested ${functionCalls.length} function call(s)`);
-          
+        // Multi-round tool call loop (max 5 rounds)
+        const MAX_TOOL_ROUNDS = 5;
+        let toolRound = 0;
+
+        while (toolRound < MAX_TOOL_ROUNDS) {
+          const functionCalls = response.functionCalls;
+          if (!functionCalls || functionCalls.length === 0) break;
+
+          toolRound++;
+          console.log(`🔧 [Google GenAI] Tool round ${toolRound}/${MAX_TOOL_ROUNDS}: ${functionCalls.length} function call(s)`);
+
           // Execute all function calls and collect results
           const functionResults: any[] = [];
           for (const functionCall of functionCalls) {
@@ -1255,7 +1294,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
               result: result,
             });
           }
-          
+
           // Add function call and results to conversation
           currentContents.push({
             role: 'model',
@@ -1266,7 +1305,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
               },
             })),
           });
-          
+
           currentContents.push({
             role: 'user',
             parts: functionResults.map((fr: any) => ({
@@ -1278,15 +1317,19 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
               },
             })),
           });
-          
-          console.log(`🔧 [Google GenAI] Sending function results back to model...`);
-          
-          // Make follow-up request with function results
+
+          console.log(`🔧 [Google GenAI] Sending function results back to model (round ${toolRound})...`);
+
+          // Re-request from model
           response = await this.client.models.generateContent({
             model: this.model,
             contents: currentContents,
             config: currentConfig,
           });
+        }
+
+        if (toolRound >= MAX_TOOL_ROUNDS) {
+          console.warn(`⚠️ [Google GenAI] Hit max tool rounds (${MAX_TOOL_ROUNDS}), proceeding with last response`);
         }
 
         // Process response parts
