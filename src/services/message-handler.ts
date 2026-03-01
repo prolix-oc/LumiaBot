@@ -3,6 +3,7 @@ import { parseMessage, storeParsedInformation } from './message-parser';
 import { conversationHistoryService } from './conversation-history';
 import { getTriggerKeywords, getErrorMessage } from './prompts';
 import { config } from '../utils/config';
+import type { ChatMessage } from './openai';
 import type { MusicActivity } from './user-activity';
 
 // Keywords that trigger the bot (case insensitive)
@@ -179,7 +180,7 @@ export interface MessageHandlerOptions {
     originalAuthor?: string;
   };
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
-  channelHistory?: string; // Recent channel conversation context
+  channelMessages?: ChatMessage[]; // Channel history converted to chat turns
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   // Orchestrator follow-up support
   orchestratorEventId?: string;
@@ -282,7 +283,7 @@ async function processVisionContent(
  * @returns The bot's response with potential reactions
  */
 export async function handleMessage(options: MessageHandlerOptions): Promise<MessageHandlerResponse> {
-  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelHistory, getUserListeningActivity, orchestratorEventId, requestFollowUp } = options;
+  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, getUserListeningActivity, orchestratorEventId, requestFollowUp } = options;
 
   try {
     // Parse message for pronouns and mentions BEFORE processing
@@ -354,14 +355,21 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       conversationHistoryService.addMessage(userId, guildId, username, 'user', processedContent);
     }
 
-    // Get conversation history for context
-    const conversationHistory = userId 
-      ? conversationHistoryService.getHistory(userId, guildId)
-      : [];
+    // Get per-user conversation summary for background context in system prompt
+    const conversationSummary = userId
+      ? conversationHistoryService.formatHistoryForPrompt(userId, guildId)
+      : '';
+
+    // Build final turns: channel history (as real turns) + current message
+    const currentMessageTurn: ChatMessage = { role: 'user', content: processedContent };
+    const finalTurns: ChatMessage[] = [
+      ...(channelMessages || []),
+      currentMessageTurn,
+    ];
 
     const aiService = getAIService();
     const response = await aiService.createChatCompletion({
-      messages: conversationHistory,
+      messages: finalTurns,
       enableSearch: shouldSearch,
       enableKnowledgeGraph: shouldQueryKnowledge,
       knowledgeQuery: processedContent, // Use processed content for knowledge query
@@ -375,7 +383,7 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       mentionedUsers,
       replyContext,
       boredomAction,
-      channelHistory,
+      conversationSummary: conversationSummary || undefined,
       getUserListeningActivity,
       orchestratorEventId,
       requestFollowUp,

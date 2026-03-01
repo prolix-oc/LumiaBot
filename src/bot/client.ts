@@ -246,16 +246,16 @@ export class DiscordBot {
         }
       }
 
-      // Build conversation history from context
-      let channelHistory: string;
+      // Convert orchestrator context messages into chat turns
       const historyMessages = context.previousMessages.filter(m => m.id !== lastMessage.id);
+      let orchestratorTurns = channelHistoryService.convertOrchestratorToTurns(
+        historyMessages,
+        config.orchestrator.botId
+      );
 
+      // For banter mode, inject metadata into the first user turn so the model
+      // understands the multi-bot discussion context
       if (context.isBanter && historyMessages.length > 0) {
-        // Banter/council mode: use structured XML tags with metadata
-        const messagesXml = context.previousMessages
-          .map(m => `<message speaker="${m.authorName}" role="${m.isBot ? 'bot' : 'user'}">${m.content}</message>`)
-          .join('\n');
-
         const metadataLines: string[] = [];
         metadataLines.push(`This is turn ${context.turnCount + 1} of ${context.maxTurns} in a multi-bot discussion.`);
         if (context.replyingToBotName) {
@@ -273,30 +273,13 @@ export class DiscordBot {
           metadataLines.push(`This is your last turn — wrap up naturally.`);
         }
 
-        channelHistory = `
-<council-discussion turn="${context.turnCount + 1}" max-turns="${context.maxTurns}">
-${metadataLines.join('\n')}
-
-<messages>
-${messagesXml}
-</messages>
-</council-discussion>
-`;
-      } else if (historyMessages.length > 0) {
-        // Non-banter orchestrated responses: use <channel-history> format
-        const formatted = historyMessages
-          .map(m => `${m.isBot ? 'Bot' : 'User'} ${m.authorName}: ${m.content}`)
-          .join('\n');
-
-        channelHistory = `
-<channel-history>
-Recent messages in this channel. Multiple participants may be active — be aware of who is addressing whom.
-
-${formatted}
-</channel-history>
-`;
-      } else {
-        channelHistory = '';
+        const banterContext = `[Banter context: ${metadataLines.join(' ')}]\n\n`;
+        // Prepend banter metadata to the first turn's content
+        if (orchestratorTurns.length > 0 && typeof orchestratorTurns[0]!.content === 'string') {
+          orchestratorTurns[0]!.content = banterContext + orchestratorTurns[0]!.content;
+        } else if (orchestratorTurns.length === 0) {
+          orchestratorTurns = [{ role: 'user', content: banterContext.trim() }];
+        }
       }
 
       // Create a working getUserListeningActivity callback using the guild
@@ -351,7 +334,7 @@ ${formatted}
         guildId: message.guildId || 'dm',
         mentionedUsers,
         replyContext: effectiveReplyContext,
-        channelHistory: channelHistory || undefined,
+        channelMessages: orchestratorTurns.length > 0 ? orchestratorTurns : undefined,
         getUserListeningActivity,
         // Orchestrator follow-up support: allow the LLM to request another turn
         orchestratorEventId: eventId,
@@ -956,14 +939,14 @@ ${formatted}
         });
       }
 
-      // Fetch recent channel history for context
-      let channelHistory: string | undefined;
+      // Fetch recent channel history and convert to chat turns
+      let channelTurns: import('../services/openai').ChatMessage[] | undefined;
       if (canType) {
         try {
           const channelMessages = await channelHistoryService.fetchChannelHistory(message.channel as TextChannel | ThreadChannel | NewsChannel | VoiceChannel | StageChannel | DMChannel, message.id);
-          channelHistory = channelHistoryService.formatHistoryForPrompt(channelMessages, message.author.id, this.client.user?.id, message.author.username);
-          if (channelHistory) {
-            console.log(`📜 [CLIENT] Added channel history context (${channelMessages.length} messages)`);
+          if (channelMessages.length > 0) {
+            channelTurns = channelHistoryService.convertToTurns(channelMessages, this.client.user?.id);
+            console.log(`📜 [CLIENT] Converted ${channelMessages.length} channel messages to ${channelTurns.length} chat turns`);
           }
         } catch (error) {
           console.warn('📜 [CLIENT] Failed to fetch channel history:', error);
@@ -1020,7 +1003,7 @@ ${formatted}
           originalAuthor: replyContext.originalAuthor,
         } : undefined,
         boredomAction,
-        channelHistory,
+        channelMessages: channelTurns,
         getUserListeningActivity,
       });
 

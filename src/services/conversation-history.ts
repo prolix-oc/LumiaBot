@@ -280,12 +280,14 @@ export class ConversationHistoryService {
   }
 
   /**
-   * Format history for system prompt context (guild-specific)
+   * Format history for system prompt context (guild-specific).
+   * Returns a concise summary of past 1:1 exchanges wrapped in XML tags.
+   * This is background context — the channel conversation turns take priority.
    */
   formatHistoryForPrompt(userId: string, guildId: string): string {
     const results = this.db.query(
-      `SELECT role, content 
-       FROM conversation_messages 
+      `SELECT role, content
+       FROM conversation_messages
        WHERE user_id = ? AND guild_id = ?
        ORDER BY timestamp ASC`
     ).all(userId, guildId) as Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -296,23 +298,22 @@ export class ConversationHistoryService {
 
     // Format last few messages for context (keep it concise)
     const recentMessages = results.slice(-6); // Last 3 exchanges (user + assistant pairs)
-    
+
     const formatted = recentMessages.map(msg => {
       const prefix = msg.role === 'user' ? 'User:' : 'You:';
       // Truncate long messages
-      const content = msg.content.length > 150 
+      const content = msg.content.length > 150
         ? msg.content.substring(0, 150) + '...'
         : msg.content;
       return `${prefix} ${content}`;
     }).join('\n');
 
     return `
-## Recent Conversation Context (This Server)
+<past-interactions>
+These are excerpts from your previous 1:1 exchanges with this user (may span multiple sessions). Use them for continuity (remembering topics, tone, rapport), but the current channel conversation (the message turns below) always takes priority for understanding what is being discussed right now.
 
 ${formatted}
-
-Continue the conversation naturally, referencing previous topics when relevant.
-`;
+</past-interactions>`;
   }
 
   /**

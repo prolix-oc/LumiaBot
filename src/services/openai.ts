@@ -90,7 +90,7 @@ export interface ChatCompletionOptions {
   };
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
   enableMusicTaste?: boolean; // DEPRECATED: Auto-inject music context (default: false). Use get_music_taste tool instead
-  channelHistory?: string; // Recent channel conversation context
+  conversationSummary?: string; // Per-user past interaction summary for system prompt
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
   // Orchestrator follow-up support
@@ -536,7 +536,7 @@ export class OpenAIService {
     boredomAction?: 'opted-in' | 'opted-out',
     enableMusicTaste?: boolean,
     lastMessageContent?: string,
-    channelHistory?: string,
+    conversationSummary?: string,
     textAttachments?: { name: string; content: string }[],
     mentionedUsers?: Map<string, string>,
     pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]
@@ -595,21 +595,19 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
-    // PRIORITY 3: Conversation history context
-    if (userId && guildId) {
-      systemPrompt += `\n\n<conversation-history-note>\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].\n</conversation-history-note>`;
+    // PRIORITY 3: Per-user past interaction summary (background context)
+    if (conversationSummary) {
+      systemPrompt += '\n\n' + conversationSummary;
     }
 
-    // PRIORITY 4: Add recent channel conversation history
-    if (channelHistory) {
-      systemPrompt += channelHistory;
-    }
-    
+    // PRIORITY 3b: Message context note — explain that the turns are the live channel
+    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The current user's latest message is the final turn.\n</message-context-note>`;
+
     // PRIORITY 5: Add reply-specific context (HIGHEST PRIORITY for this specific turn)
     if (replyContext?.isReply && replyContext.originalContent) {
       systemPrompt += this.buildReplyContextPrompt(replyContext);
     }
-    
+
     // Add text file attachments if present
     if (textAttachments && textAttachments.length > 0) {
       systemPrompt += `\n\n<attached-files>`;
@@ -778,7 +776,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
   }
 
   async createChatCompletion(options: ChatCompletionOptions): Promise<string> {
-    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, channelHistory, mentionedUsers } = options;
+    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -811,7 +809,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
 
     // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers, pageContents);
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
 
     // Convert image URLs to base64 data URIs so external APIs can access them
     let processedImages = images;
@@ -886,7 +884,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         } as OpenAI.ChatCompletionMessageParam;
       }),
     ];
-    
+
     // Clean up uploaded videos after use (in finally block later)
 
     // Determine if we need tools at all
@@ -1732,7 +1730,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
   }
 
   async *streamChatCompletion(options: ChatCompletionOptions): AsyncGenerator<string> {
-    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, channelHistory, mentionedUsers } = options;
+    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -1779,7 +1777,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
 
     // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, channelHistory, textAttachments, mentionedUsers, pageContents);
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
 
     // Pre-response persona directive — prepended to last user message
     const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';

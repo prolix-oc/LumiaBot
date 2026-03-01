@@ -85,7 +85,7 @@ export interface ChatCompletionOptions {
   };
   boredomAction?: 'opted-in' | 'opted-out';
   enableMusicTaste?: boolean;
-  channelHistory?: string;
+  conversationSummary?: string; // Per-user past interaction summary for system prompt
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
   // Orchestrator follow-up support
@@ -290,7 +290,7 @@ export class GoogleGenAIService {
     hasVideos: boolean,
     knowledgeContext?: string
   ): string {
-    const { userId, username, guildId, replyContext, boredomAction, channelHistory, enableMusicTaste, textAttachments, pageContents, mentionedUsers } = options;
+    const { userId, username, guildId, replyContext, boredomAction, conversationSummary, enableMusicTaste, textAttachments, pageContents, mentionedUsers } = options;
     
     // Add current date/time context at the very beginning
     const now = new Date();
@@ -347,21 +347,19 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
-    // PRIORITY 3: Conversation history context
-    if (userId && guildId) {
-      systemPrompt += `\n\n<conversation-history-note>\nRefer to the conversation messages above for your recent exchanges with this user. Each user message is prefixed with their username in [brackets].\n</conversation-history-note>`;
+    // PRIORITY 3: Per-user past interaction summary (background context)
+    if (conversationSummary) {
+      systemPrompt += '\n\n' + conversationSummary;
     }
 
-    // PRIORITY 4: Add recent channel conversation history
-    if (channelHistory) {
-      systemPrompt += channelHistory;
-    }
-    
+    // PRIORITY 3b: Message context note — explain that the turns are the live channel
+    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The current user's latest message is the final turn.\n</message-context-note>`;
+
     // PRIORITY 5: Add reply-specific context (HIGHEST PRIORITY for this specific turn)
     if (replyContext?.isReply && replyContext.originalContent) {
       systemPrompt += this.buildReplyContextPrompt(replyContext);
     }
-    
+
     // Add text file attachments if present
     if (textAttachments && textAttachments.length > 0) {
       systemPrompt += `\n\n<attached-files>`;

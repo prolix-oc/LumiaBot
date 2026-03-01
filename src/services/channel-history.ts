@@ -1,5 +1,7 @@
 import type { Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel } from 'discord.js';
 import { config } from '../utils/config';
+import type { ChatMessage } from './openai';
+import type { ContextMessage } from './orchestrator/types';
 
 export interface ChannelMessage {
   id: string;
@@ -96,51 +98,62 @@ export class ChannelHistoryService {
   }
 
   /**
-   * Format channel history for inclusion in system prompt
-   * Renames other bots to prevent confusion (strips current bot's name from other bot names)
+   * Convert channel messages into ChatMessage[] turns for the LLM.
+   * - Messages from the current bot become assistant role
+   * - All other messages (users + other bots) become user role with [displayName]: prefix
+   * - Consecutive same-role messages are merged to avoid API errors
    */
-  formatHistoryForPrompt(messages: ChannelMessage[], currentUserId: string, currentBotId?: string, currentUsername?: string): string {
+  convertToTurns(messages: ChannelMessage[], currentBotId?: string): ChatMessage[] {
     if (messages.length === 0) {
-      return '';
+      return [];
     }
 
-    const botName = config.bot.name;
-
-    const formatted = messages.map(msg => {
-      const isCurrentUser = msg.authorId === currentUserId;
+    // First pass: assign roles and build display names
+    const rawTurns: { role: 'user' | 'assistant'; content: string }[] = messages.map(msg => {
       const isCurrentBot = msg.isBot && msg.authorId === currentBotId;
-      const isOtherBot = msg.isBot && msg.authorId !== currentBotId;
 
-      let prefix: string;
       if (isCurrentBot) {
-        prefix = `You (${botName}):`;
-      } else if (isOtherBot) {
-        // Rename other bots to strip shared naming patterns and prevent identity confusion
-        // e.g. if botName is "Bad Kitty", strip "Lumia" from "Ditsy Slime Girl Lumia"
-        // This prevents the AI from confusing itself with other bot instances
-        let otherBotName = msg.authorUsername;
-        // Strip "Lumia" (shared brand name across bot instances) to differentiate
-        otherBotName = otherBotName.replace(/\s*Lumia\s*/gi, '').trim();
-        if (!otherBotName) {
-          otherBotName = 'Other Bot';
-        }
-        prefix = `${otherBotName}:`;
-      } else if (isCurrentUser) {
-        prefix = `${currentUsername || msg.authorUsername} (current user):`;
-      } else {
-        prefix = `${msg.authorUsername}:`;
+        return { role: 'assistant' as const, content: msg.content };
       }
 
-      return `${prefix} ${msg.content}`;
-    }).join('\n');
+      // For other bots, strip "Lumia" branding to prevent identity confusion
+      let displayName = msg.authorUsername;
+      if (msg.isBot && msg.authorId !== currentBotId) {
+        displayName = displayName.replace(/\s*Lumia\s*/gi, '').trim() || 'Other Bot';
+      }
 
-    return `
-<channel-history>
-Recent messages in this channel. Multiple participants may be active — be aware of who is addressing whom.
+      return { role: 'user' as const, content: `[${displayName}]: ${msg.content}` };
+    });
 
-${formatted}
-</channel-history>
-`;
+    // Second pass: merge consecutive same-role messages
+    const merged: ChatMessage[] = [];
+    for (const turn of rawTurns) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === turn.role && typeof last.content === 'string') {
+        last.content += '\n' + turn.content;
+      } else {
+        merged.push({ role: turn.role, content: turn.content });
+      }
+    }
+
+    return merged;
+  }
+
+  /**
+   * Convert orchestrator ContextMessage[] into ChatMessage[] turns.
+   * Maps ContextMessage fields to ChannelMessage and delegates to convertToTurns().
+   */
+  convertOrchestratorToTurns(messages: ContextMessage[], currentBotId?: string): ChatMessage[] {
+    const channelMessages: ChannelMessage[] = messages.map(m => ({
+      id: m.id,
+      authorId: m.authorId,
+      authorUsername: m.authorName,
+      content: m.content,
+      timestamp: m.timestamp instanceof Date ? m.timestamp : new Date(m.timestamp),
+      isBot: m.isBot,
+    }));
+
+    return this.convertToTurns(channelMessages, currentBotId);
   }
 }
 
