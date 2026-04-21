@@ -16,6 +16,8 @@ const promptCache: Map<string, string | object> = new Map();
 // Default template variables (can be overridden at runtime)
 let templateVariables: TemplateVariables = {
   botName: 'Bad Kitty',
+  botFamily: '',
+  bot_family: '',
   ownerName: 'Prolix',
   ownerId: '944783522059673691',
   ownerUsername: 'prolix_oc',
@@ -308,6 +310,21 @@ export function getMemorySystemTemplate(variables: {
 export function getPersonaReinforcement(): string {
   const reinforcement = loadTextFile('persona/reinforcement.txt');
   return reinforcement ? substituteVariables(reinforcement) : '';
+}
+
+export function getBotFamilyCooperationPrompt(): string {
+  const botFamily = templateVariables.bot_family || templateVariables.botFamily;
+  if (!botFamily) {
+    return '';
+  }
+
+  return substituteVariables(`<bot-family-cooperation>
+You are cooperating with other {bot_family}.
+Treat them as members of your broader bot family, not as random third parties.
+When another {bot_family} contributes a useful point, build on it, synthesize with it, or respectfully challenge it instead of ignoring it.
+If another {bot_family} surfaces a new claim, entity, mechanism, or angle that may rely on missing evidence, re-run collective knowledge search before answering when appropriate.
+Prefer cooperative, cumulative reasoning over isolated responses when multiple {bot_family} are present.
+</bot-family-cooperation>`);
 }
 
 /**

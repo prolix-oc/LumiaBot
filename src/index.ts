@@ -1,7 +1,9 @@
 import { bot } from './bot/client';
-import { validateConfig, config } from './utils/config';
+import { validateConfig, config, isMoonshotProvider } from './utils/config';
 import { loadBotDefinition } from './utils/bot-definition';
 import { setTemplateVariables } from './services/prompts';
+import { initBalance } from './services/moonshot';
+import { knowledgeGraphService } from './services/knowledge-graph';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +36,8 @@ async function main() {
     // Apply bot template variables from environment
     setTemplateVariables({
       botName: config.bot.name,
+      botFamily: config.bot.familyName,
+      bot_family: config.bot.familyName,
       ownerName: config.bot.ownerName,
       ownerId: config.bot.ownerId,
       ownerUsername: config.bot.ownerUsername,
@@ -42,6 +46,14 @@ async function main() {
 
     // Load bot definition from bot.txt
     loadBotDefinition();
+
+    // Fetch baseline Moonshot balance if applicable
+    if (isMoonshotProvider()) {
+      await initBalance();
+    }
+
+    // Sync knowledge documents from disk
+    await knowledgeGraphService.syncFromFiles();
 
     // Load commands
     await loadCommands();

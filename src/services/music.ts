@@ -522,6 +522,33 @@ export class MusicService {
     };
   }
 
+  hasTracks(): boolean {
+    const result = this.db.query(
+      'SELECT COUNT(*) as count FROM music_tracks'
+    ).get() as { count: number };
+
+    return result.count > 0;
+  }
+
+  getToolSummary(limit: number = 5): string {
+    const stats = this.getStats();
+    if (stats.totalTracks === 0) {
+      return 'No Spotify playlists have been imported yet.';
+    }
+
+    const playlists = this.getAllPlaylists()
+      .slice(0, limit)
+      .map((playlist) => `"${playlist.name}"`);
+    const playlistSummary = playlists.length > 0 ? playlists.join(', ') : 'no playlist names available';
+
+    const topGenres = stats.topGenres
+      .slice(0, 5)
+      .map((genre) => genre.genre);
+    const genreSummary = topGenres.length > 0 ? topGenres.join(', ') : 'mixed genres';
+
+    return `Spotify library has ${stats.totalTracks} tracks from ${stats.totalPlaylists} playlists and ${stats.totalArtists} artists. Playlist preview: ${playlistSummary}. Top genres: ${genreSummary}.`;
+  }
+
   /**
    * Get random tracks for music taste queries
    */
@@ -669,6 +696,43 @@ export class MusicService {
         genres,
       };
     });
+  }
+
+  searchLibrary(query: string, limit: number = 10): MusicTrackWithDetails[] {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) {
+      return [];
+    }
+
+    const trackMatches = this.searchTracks(trimmedQuery, limit);
+    const normalizedQuery = trimmedQuery.toLowerCase();
+    const genreMatches = this.getAllGenres().filter((genre) => {
+      const normalizedGenre = genre.toLowerCase();
+      return normalizedGenre === normalizedQuery ||
+        normalizedGenre.includes(normalizedQuery) ||
+        normalizedQuery.includes(normalizedGenre);
+    });
+
+    const results = new Map<string, MusicTrackWithDetails>();
+
+    for (const track of trackMatches) {
+      results.set(track.spotifyId, track);
+      if (results.size >= limit) {
+        return Array.from(results.values()).slice(0, limit);
+      }
+    }
+
+    for (const genre of genreMatches.slice(0, 3)) {
+      const genreTracks = this.getTracksByGenre(genre, Math.max(3, Math.ceil(limit / Math.max(genreMatches.length, 1))));
+      for (const track of genreTracks) {
+        results.set(track.spotifyId, track);
+        if (results.size >= limit) {
+          return Array.from(results.values()).slice(0, limit);
+        }
+      }
+    }
+
+    return Array.from(results.values()).slice(0, limit);
   }
 
   /**

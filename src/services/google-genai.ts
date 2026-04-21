@@ -4,6 +4,7 @@ import { getBotDefinition } from '../utils/bot-definition';
 import { searxngService } from './searxng';
 import { userMemoryService, PRONOUN_FALLBACK } from './user-memory';
 import { knowledgeGraphService } from './knowledge-graph';
+import type { KnowledgeCandidate } from './knowledge-graph';
 import { musicService } from './music';
 import { videoService } from './video';
 import { boredomService } from './boredom';
@@ -16,7 +17,8 @@ import {
   getMusicTasteTemplate,
   getReplyContextTemplate,
   getMemorySystemTemplate,
-  getPersonaReinforcement
+  getPersonaReinforcement,
+  getBotFamilyCooperationPrompt
 } from './prompts';
 
 /**
@@ -65,7 +67,6 @@ export interface ChatCompletionOptions {
   messages: ChatMessage[];
   enableSearch?: boolean;
   enableKnowledgeGraph?: boolean;
-  knowledgeQuery?: string;
   stream?: boolean;
   temperature?: number;
   maxTokens?: number;
@@ -73,6 +74,8 @@ export interface ChatCompletionOptions {
   videos?: { url: string; mimeType?: string }[]; // URLs of videos to include (Gemini 3 only)
   textAttachments?: { name: string; content: string }[]; // Text file attachments
   pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
+  knowledgeCandidates?: KnowledgeCandidate[];
+  collectiveKnowledgeContext?: string;
   userId?: string;
   username?: string;
   guildId?: string;
@@ -84,13 +87,16 @@ export interface ChatCompletionOptions {
     originalAuthor?: string;
   };
   boredomAction?: 'opted-in' | 'opted-out';
+  orchestratorContextNote?: string;
   enableMusicTaste?: boolean;
   conversationSummary?: string; // Per-user past interaction summary for system prompt
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
   // Orchestrator follow-up support
   orchestratorEventId?: string; // The event ID for the current orchestrated conversation
-  requestFollowUp?: (eventId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
+  orchestratorTurnId?: string; // The current orchestrator turn ID
+  requestFollowUp?: (eventId: string, turnId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
+  requestCollectiveKnowledge?: (query: string, maxResults?: number) => Promise<string>;
 }
 
 /**
@@ -288,9 +294,10 @@ export class GoogleGenAIService {
   private buildSystemPrompt(
     options: ChatCompletionOptions,
     hasVideos: boolean,
-    knowledgeContext?: string
+    knowledgeContext?: string,
+    collectiveKnowledgeContext?: string
   ): string {
-    const { userId, username, guildId, replyContext, boredomAction, conversationSummary, enableMusicTaste, textAttachments, pageContents, mentionedUsers } = options;
+    const { userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, conversationSummary, enableMusicTaste, textAttachments, pageContents, mentionedUsers } = options;
     
     // Add current date/time context at the very beginning
     const now = new Date();
@@ -312,6 +319,11 @@ Today is ${currentDateTime}.
 <identity>
 ${getBotDefinition()}
 </identity>`;
+
+    const botFamilyCooperation = getBotFamilyCooperationPrompt();
+    if (botFamilyCooperation) {
+      systemPrompt += `\n\n${botFamilyCooperation}`;
+    }
     
     // Get last message content for music detection
     const messages = options.messages;
@@ -353,11 +365,15 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     // PRIORITY 3b: Message context note — explain that the turns are the live channel
-    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The current user's latest message is the final turn.\n</message-context-note>`;
+    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The final turn is the active message you are responding to; in orchestrator mode it may be from another bot rather than from a human. If a <current-user> block is present, that identifies the active human speaker for this exchange. If you see transcript blocks like <orchestrator-bot-message> or <orchestrator-user-message>, treat them as quoted messages from distinct participants. Bot-tagged transcript blocks are not your persona unless they appear as assistant-role turns.\n</message-context-note>`;
 
     // PRIORITY 5: Add reply-specific context (HIGHEST PRIORITY for this specific turn)
     if (replyContext?.isReply && replyContext.originalContent) {
       systemPrompt += this.buildReplyContextPrompt(replyContext);
+    }
+
+    if (orchestratorContextNote) {
+      systemPrompt += `\n\n<orchestrator-session>\n${orchestratorContextNote}\n</orchestrator-session>`;
     }
 
     // Add text file attachments if present
@@ -389,6 +405,10 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     // Add knowledge graph context if available
     if (knowledgeContext) {
       systemPrompt += `\n\n${knowledgeContext}`;
+    }
+
+    if (collectiveKnowledgeContext) {
+      systemPrompt += `\n\n${collectiveKnowledgeContext}`;
     }
     
     // PRIORITY 6: Add stored memory/opinion context (LOWER PRIORITY than recent conversation)
@@ -536,11 +556,18 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     // Web search tool
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+    const knowledgeCandidates = options.knowledgeCandidates || [];
+    const knowledgeToolEnabled = options.enableKnowledgeGraph !== false && knowledgeCandidates.length > 0;
+    const knowledgeSummary = knowledgeToolEnabled
+      ? knowledgeGraphService.formatCandidateSummary(knowledgeCandidates)
+      : '';
+    const musicToolEnabled = musicService.hasTracks();
+    const musicSummary = musicToolEnabled ? musicService.getToolSummary(4) : '';
     
-    if (options.enableSearch) {
+    if (options.enableSearch !== false) {
       tools.push({
         name: 'web_search',
-        description: `Search the web for current information, news, facts, or any up-to-date content. Today is ${currentDate}. Use this when the user asks about recent events, current information, or anything that requires searching the internet.`,
+        description: `Search the web for current information, source verification, news, facts, or anything that should be confirmed against live internet results. Today is ${currentDate}. Use this when the user asks you to confirm something from the web, wants a source-backed answer, or asks about recent or fast-changing information.`,
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -554,24 +581,20 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       });
     }
     
-    // Knowledge graph tool
-    if (options.enableKnowledgeGraph) {
+    // Knowledge document tool - raw fetch only from deterministic candidates
+    if (knowledgeToolEnabled) {
       tools.push({
-        name: 'query_knowledge_base',
-        description: 'Query the knowledge base for domain-specific information. Use this when the user asks about Lucid Loom presets, specific technical topics, or anything that might be in the knowledge base.',
+        name: 'get_knowledge_document',
+        description: `Fetch the full raw content of one of the deterministic knowledge candidates already matched for this message. Only use doc IDs from this list: ${knowledgeSummary}`,
         parameters: {
           type: Type.OBJECT,
           properties: {
-            query: {
-              type: Type.STRING,
-              description: 'The query to search for in the knowledge base.',
-            },
-            maxResults: {
+            docId: {
               type: Type.NUMBER,
-              description: 'Maximum number of results to retrieve (default: 3).',
+              description: 'The document ID from the deterministic knowledge candidate list in the prompt.',
             },
           },
-          required: ['query'],
+          required: ['docId'],
         },
       });
     }
@@ -623,15 +646,35 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       });
     }
     
-    // Music taste tool - ALWAYS available so LLM can use it when needed
-    tools.push({
-      name: 'get_music_taste',
-      description: 'Get your music taste information - what songs, artists, and genres you know. Use this when someone asks about your music taste, what you listen to, your favorite songs, or wants music recommendations. Returns real tracks from your imported Spotify playlists.',
-      parameters: {
-        type: Type.OBJECT,
-        properties: {},
-      },
-    });
+    if (musicToolEnabled) {
+      tools.push({
+        name: 'get_music_taste',
+        description: `Get your music taste overview from imported Spotify playlists. Use this for questions about what you listen to, your taste, or broad music recommendations. ${musicSummary}`,
+        parameters: {
+          type: Type.OBJECT,
+          properties: {},
+        },
+      });
+
+      tools.push({
+        name: 'search_music_library',
+        description: `Search your imported Spotify library for specific tracks, artists, or genres. Use this when the user mentions a specific song, artist, vibe, or genre and you want grounded music context instead of guessing. ${musicSummary}`,
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: 'The track, artist, or genre to look for in the imported Spotify library.',
+            },
+            maxResults: {
+              type: Type.NUMBER,
+              description: 'Maximum number of matches to return (default: 5).',
+            },
+          },
+          required: ['query'],
+        },
+      });
+    }
 
     // User current listening tool - check what a user is currently listening to on Spotify
     if (options.getUserListeningActivity) {
@@ -809,7 +852,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     }
 
     // Orchestrator follow-up tool - only available during orchestrated conversations
-    if (options.orchestratorEventId && options.requestFollowUp) {
+    if (options.orchestratorEventId && options.orchestratorTurnId && options.requestFollowUp) {
       tools.push({
         name: 'request_follow_up',
         description: `Request a follow-up turn in an orchestrated multi-bot conversation. Use this when another bot said something you want to respond to, or when the conversation naturally warrants you jumping back in. The orchestrator will approve or deny based on the max turn limit. Only use this if you genuinely have something to add — don't request follow-ups just because you can.`,
@@ -822,6 +865,27 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             },
           },
           required: ['reason'],
+        },
+      });
+    }
+
+    if (options.requestCollectiveKnowledge) {
+      tools.push({
+        name: 'query_collective_knowledge',
+        description: 'Search the orchestrator knowledge graph and the other connected bots\' local knowledge graphs. Use this when local knowledge is missing, when shared orchestrator-backed knowledge is preferred, or when you want a second source of truth from the wider bot network. If another cooperating bot surfaces a new claim, entity, mechanism, or angle that may depend on missing evidence, use this again before answering.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: 'A focused search query describing the missing fact, topic, or concept you want the other connected bots to look up in their local knowledge graphs.',
+            },
+            maxResults: {
+              type: Type.NUMBER,
+              description: 'Maximum combined results to return from the other connected bots (default: 5).',
+            },
+          },
+          required: ['query'],
         },
       });
     }
@@ -849,13 +913,19 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           return formatted;
         }
         
-        case 'query_knowledge_base': {
-          const context = await knowledgeGraphService.queryKnowledgeBase(
-            args.query,
-            args.maxResults || 3
-          );
-          console.log(`🔧 [Google GenAI] Knowledge base query completed`);
-          return context || 'No relevant documents found in the knowledge base for this query.';
+        case 'get_knowledge_document': {
+          const allowedCandidates = options.knowledgeCandidates || [];
+          const isAllowed = allowedCandidates.some((candidate) => candidate.id === args.docId);
+          if (!isAllowed) {
+            const allowedList = allowedCandidates.length > 0
+              ? allowedCandidates.map((candidate) => `${candidate.id}:${candidate.title}`).join(', ')
+              : 'none';
+            return `Error: Doc ID ${args.docId} is not in the current deterministic candidate list. Allowed candidates: ${allowedList}.`;
+          }
+
+          const document = knowledgeGraphService.getDocumentToolPayload(args.docId);
+          console.log(`🔧 [Google GenAI] Knowledge document fetch completed`);
+          return document;
         }
         
         case 'store_user_opinion': {
@@ -929,6 +999,27 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           
           console.log(`🔧 [Google GenAI] Retrieved music taste`);
           return result;
+        }
+
+        case 'search_music_library': {
+          const results = musicService.searchLibrary(args.query, args.maxResults || 5);
+          if (results.length === 0) {
+            return `No tracks or artists found in your Spotify library for "${args.query}".`;
+          }
+
+          let response = `Matches in your Spotify library for "${args.query}":\n`;
+          results.forEach((track, index) => {
+            const genres = track.genres.slice(0, 3).join(', ');
+            response += `\n${index + 1}. "${track.name}" by ${track.artists.map(a => a.name).join(', ')}`;
+            response += `\n   Album: ${track.album.name}`;
+            if (genres) {
+              response += `\n   Genres: ${genres}`;
+            }
+            response += `\n   Spotify: ${track.spotifyUrl}`;
+          });
+
+          console.log(`🔧 [Google GenAI] Music library search completed`);
+          return response;
         }
 
         case 'get_user_current_listening': {
@@ -1076,11 +1167,12 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
         }
 
         case 'request_follow_up': {
-          if (!options.orchestratorEventId || !options.requestFollowUp) {
+          if (!options.orchestratorEventId || !options.orchestratorTurnId || !options.requestFollowUp) {
             return 'Error: Follow-up requests are only available during orchestrated conversations.';
           }
           const result = await options.requestFollowUp(
             options.orchestratorEventId,
+            options.orchestratorTurnId,
             undefined, // targetBotId — let orchestrator decide
             args.reason
           );
@@ -1090,6 +1182,15 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           } else {
             return `Follow-up request denied: ${result.reason}. The conversation has reached its turn limit or the request was invalid.`;
           }
+        }
+
+        case 'query_collective_knowledge': {
+          if (!options.requestCollectiveKnowledge) {
+            return 'Error: Collective knowledge queries are not available right now.';
+          }
+          const result = await options.requestCollectiveKnowledge(args.query, args.maxResults);
+          console.log('🔧 [Google GenAI] Collective knowledge query completed');
+          return result;
         }
 
         default:
@@ -1154,24 +1255,12 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     if (tools) {
       genConfig.tools = [{ functionDeclarations: tools }];
       const toolNames = tools.map(t => t.name).filter((name): name is string => name !== undefined);
-      // When thinking is enabled, use AUTO mode (required for thinking compatibility)
-      // When thinking is disabled, use ANY mode to force tool calls
-      if (config.thinking.enabled) {
-        genConfig.toolConfig = {
-          functionCallingConfig: {
-            mode: FunctionCallingConfigMode.AUTO,
-          },
-        };
-        console.log(`🔧 [Google GenAI] Enabled ${tools.length} tool(s) in AUTO mode (thinking enabled): ${toolNames.join(', ')}`);
-      } else {
-        genConfig.toolConfig = {
-          functionCallingConfig: {
-            mode: FunctionCallingConfigMode.ANY,
-            allowedFunctionNames: toolNames,
-          },
-        };
-        console.log(`🔧 [Google GenAI] Enabled ${tools.length} tool(s) in ANY mode (forced): ${toolNames.join(', ')}`);
-      }
+      genConfig.toolConfig = {
+        functionCallingConfig: {
+          mode: FunctionCallingConfigMode.AUTO,
+        },
+      };
+      console.log(`🔧 [Google GenAI] Enabled ${tools.length} tool(s) in AUTO mode: ${toolNames.join(', ')}`);
       console.log(`🔧 [Google GenAI] Disabled native Google search - using SearXNG only`);
     }
 
@@ -1242,10 +1331,41 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     if (!content || content.trim().length === 0) {
       return true;
     }
-    
+
     // Check if content is only reasoning artifacts after filtering
     const filtered = this.filterReasoningContent(content);
     return filtered.trim().length === 0;
+  }
+
+  /**
+   * Detect hallucinated API response objects that the model outputs as text.
+   * Some models occasionally emit raw API response structures instead of
+   * actual conversational content.
+   */
+  private isHallucinatedResponse(content: string): boolean {
+    const trimmed = content.trim();
+
+    // Detect "(Empty response: { ... })" wrapper format
+    if (/^\(Empty response:\s*\{[\s\S]*\}\s*\)$/i.test(trimmed)) {
+      return true;
+    }
+
+    // Detect raw API response objects containing typical completion fields
+    // Must match at least 2 of these API-specific keys to avoid false positives
+    const apiResponseIndicators = [
+      /['"]?stop_reason['"]?\s*:/,
+      /['"]?input_tokens['"]?\s*:/,
+      /['"]?output_tokens['"]?\s*:/,
+      /['"]?finish_reason['"]?\s*:/,
+      /['"]?type['"]?\s*:\s*['"]thinking['"]/,
+      /['"]?signature['"]?\s*:\s*['"]/,
+    ];
+    const matchCount = apiResponseIndicators.filter(re => re.test(trimmed)).length;
+    if (matchCount >= 2) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -1357,16 +1477,17 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
         // Apply fallback reasoning filter as safety net
         content = this.filterReasoningContent(content);
 
-        // Check if response is empty
-        if (this.isEmptyResponse(content)) {
-          console.warn(`⚠️ [Google GenAI] Empty response on attempt ${attempt}, retrying...`);
+        // Check if response is empty or a hallucinated API response
+        if (this.isEmptyResponse(content) || this.isHallucinatedResponse(content)) {
+          const reason = this.isEmptyResponse(content) ? 'empty' : 'hallucinated API response';
+          console.warn(`⚠️ [Google GenAI] Bad response (${reason}) on attempt ${attempt}, retrying...`);
           lastError = new Error('Empty response from LLM');
-          
+
           // Slightly increase temperature for retry to encourage variety
           if (currentConfig.temperature !== undefined) {
             currentConfig.temperature = Math.min(currentConfig.temperature + 0.1, 1.0);
           }
-          
+
           // Exponential backoff: 1.5s, 3s, 6s
           const backoffMs = 1500 * Math.pow(2, attempt - 1);
           console.log(`⏱️ [Google GenAI] Backing off for ${backoffMs}ms before retry...`);
@@ -1406,20 +1527,14 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     try {
       console.log(`🔮 [Google GenAI] Creating chat completion...`);
 
-      const { images, videos, enableKnowledgeGraph, knowledgeQuery } = options;
+      const { images, videos } = options;
       const hasVideos = !!(videos && videos.length > 0);
-      
-      // Query knowledge graph if enabled
-      let knowledgeContext: string | undefined;
-      if (enableKnowledgeGraph) {
-        const query = knowledgeQuery || options.messages[options.messages.length - 1]?.content?.toString() || '';
-        if (query) {
-          knowledgeContext = await knowledgeGraphService.queryKnowledgeBase(query, 3);
-        }
-      }
+      const knowledgeCandidateContext = options.knowledgeCandidates && options.knowledgeCandidates.length > 0
+        ? knowledgeGraphService.formatCandidateContext(options.knowledgeCandidates)
+        : undefined;
       
       // Build enhanced system prompt with all context
-      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeContext);
+      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeCandidateContext, options.collectiveKnowledgeContext);
       
       // Convert messages (system prompt will be used instead of extracting from messages)
       let { contents } = await this.convertMessages(options.messages, images, videos);
@@ -1470,20 +1585,14 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
     try {
       console.log(`🔮 [Google GenAI] Starting streaming completion...`);
 
-      const { images, videos, enableKnowledgeGraph, knowledgeQuery } = options;
+      const { images, videos } = options;
       const hasVideos = !!(videos && videos.length > 0);
-      
-      // Query knowledge graph if enabled
-      let knowledgeContext: string | undefined;
-      if (enableKnowledgeGraph) {
-        const query = knowledgeQuery || options.messages[options.messages.length - 1]?.content?.toString() || '';
-        if (query) {
-          knowledgeContext = await knowledgeGraphService.queryKnowledgeBase(query, 3);
-        }
-      }
+      const knowledgeCandidateContext = options.knowledgeCandidates && options.knowledgeCandidates.length > 0
+        ? knowledgeGraphService.formatCandidateContext(options.knowledgeCandidates)
+        : undefined;
       
       // Build enhanced system prompt with all context
-      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeContext);
+      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeCandidateContext, options.collectiveKnowledgeContext);
       
       // Convert messages (system prompt will be used instead of extracting from messages)
       const { contents } = await this.convertMessages(options.messages, images, videos);

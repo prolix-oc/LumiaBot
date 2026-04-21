@@ -1,7 +1,9 @@
 import { getAIService, getVisionService } from './google-genai';
 import { parseMessage, storeParsedInformation } from './message-parser';
 import { conversationHistoryService } from './conversation-history';
+import { channelHistoryService } from './channel-history';
 import { getTriggerKeywords, getErrorMessage } from './prompts';
+import { knowledgeGraphService, type KnowledgeCandidate } from './knowledge-graph';
 import { config } from '../utils/config';
 import type { ChatMessage } from './openai';
 import type { MusicActivity } from './user-activity';
@@ -9,15 +11,11 @@ import type { MusicActivity } from './user-activity';
 // Keywords that trigger the bot (case insensitive)
 // Loaded dynamically from prompt_storage/config/triggers.json
 let TRIGGER_KEYWORDS: string[] = [];
-let SEARCH_INTENT_PATTERNS: string[] = [];
-let KNOWLEDGE_INTENT_PATTERNS: string[] = [];
 
 // Initialize trigger keywords
 function initializeTriggers(): void {
   const triggers = getTriggerKeywords();
   TRIGGER_KEYWORDS = triggers.botMention;
-  SEARCH_INTENT_PATTERNS = triggers.searchIntent;
-  KNOWLEDGE_INTENT_PATTERNS = triggers.knowledgeIntent;
 }
 
 // Load triggers on module initialization
@@ -88,52 +86,6 @@ export function extractTriggerKeywords(content: string): string[] {
 }
 
 /**
- * Detect if the user is asking for web search based on message content
- * Uses heuristics to determine search intent
- * @param content - The message content
- * @returns boolean indicating if web search should be enabled
- */
-export function detectSearchIntent(content: string): boolean {
-  const lowerContent = content.toLowerCase().trim();
-  
-  for (const pattern of SEARCH_INTENT_PATTERNS) {
-    // Create regex to match the pattern as a word or phrase
-    const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escapedPattern}\\b`, 'i');
-    
-    if (regex.test(lowerContent)) {
-      console.log(`🔍 [HEURISTIC] Search intent detected: "${pattern}"`);
-      return true;
-    }
-  }
-  
-  return false;
-}
-
-/**
- * Detect if the user is asking about domain-specific knowledge
- * Uses heuristics to determine knowledge graph query intent
- * @param content - The message content
- * @returns boolean indicating if knowledge graph should be queried
- */
-export function detectKnowledgeIntent(content: string): boolean {
-  const lowerContent = content.toLowerCase().trim();
-  
-  for (const pattern of KNOWLEDGE_INTENT_PATTERNS) {
-    // Create regex to match the pattern as a word or phrase
-    const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escapedPattern}\\b`, 'i');
-    
-    if (regex.test(lowerContent)) {
-      console.log(`📚 [HEURISTIC] Knowledge intent detected: "${pattern}"`);
-      return true;
-    }
-  }
-  
-  return false;
-}
-
-/**
  * Extract the message content without the bot mention
  * @param content - The message content
  * @param botId - The bot's user ID
@@ -168,6 +120,7 @@ export interface MessageHandlerOptions {
   videoUrls?: { url: string; mimeType?: string }[]; // Video attachments for Gemini 3 models
   textAttachments?: { name: string; content: string }[]; // Text file attachments
   pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
+  knowledgeCandidates?: KnowledgeCandidate[];
   userId?: string;
   username?: string;
   guildId: string;
@@ -181,10 +134,20 @@ export interface MessageHandlerOptions {
   };
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
   channelMessages?: ChatMessage[]; // Channel history converted to chat turns
+  orchestratorContextNote?: string;
+  currentMessageSpeaker?: {
+    authorId: string;
+    authorName: string;
+    isBot: boolean;
+    format?: 'default' | 'orchestrator';
+    currentBotId?: string;
+  };
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   // Orchestrator follow-up support
   orchestratorEventId?: string;
-  requestFollowUp?: (eventId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
+  orchestratorTurnId?: string;
+  requestFollowUp?: (eventId: string, turnId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
+  requestCollectiveKnowledge?: (query: string, maxResults?: number) => Promise<string>;
 }
 
 export interface MessageHandlerResponse {
@@ -283,7 +246,7 @@ async function processVisionContent(
  * @returns The bot's response with potential reactions
  */
 export async function handleMessage(options: MessageHandlerOptions): Promise<MessageHandlerResponse> {
-  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, getUserListeningActivity, orchestratorEventId, requestFollowUp } = options;
+  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, knowledgeCandidates, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, orchestratorContextNote, currentMessageSpeaker, getUserListeningActivity, orchestratorEventId, orchestratorTurnId, requestFollowUp, requestCollectiveKnowledge } = options;
 
   try {
     // Parse message for pronouns and mentions BEFORE processing
@@ -303,21 +266,35 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       }
     }
 
-    // If search not explicitly provided, detect using heuristics
-    const shouldSearch = enableSearch !== undefined ? enableSearch : detectSearchIntent(content);
-    // If knowledge graph not explicitly provided, detect using heuristics
-    const shouldQueryKnowledge = enableKnowledgeGraph !== undefined ? enableKnowledgeGraph : detectKnowledgeIntent(content);
+    const shouldSearch = enableSearch !== undefined ? enableSearch : true;
+    const shouldQueryLocalKnowledge = enableKnowledgeGraph !== undefined
+      ? enableKnowledgeGraph
+      : (config.knowledge.sourceMode === 0 || config.knowledge.sourceMode === 2) && knowledgeGraphService.hasDocuments();
+
+    const shouldQueryCollectiveKnowledge = typeof requestCollectiveKnowledge === 'function' && (config.knowledge.sourceMode === 1 || config.knowledge.sourceMode === 2);
 
     if (shouldSearch) {
-      console.log(`🔍 [HANDLER] Web search will be enabled for this message`);
+      console.log(`🔍 [HANDLER] Web search tool will be attached for model-directed use`);
     } else {
-      console.log(`🔍 [HANDLER] Web search will NOT be enabled (no search intent detected)`);
+      console.log(`🔍 [HANDLER] Web search tool is disabled for this message`);
     }
 
-    if (shouldQueryKnowledge) {
-      console.log(`📚 [HANDLER] Knowledge graph will be queried for this message`);
+    const resolvedKnowledgeCandidates = shouldQueryLocalKnowledge
+      ? (knowledgeCandidates || knowledgeGraphService.findCandidateDocuments(content, 5))
+      : [];
+
+    if (resolvedKnowledgeCandidates.length > 0) {
+      console.log(`📚 [HANDLER] Knowledge document tool will be attached with deterministic candidates`);
+      console.log(`📚 [HANDLER] Found ${resolvedKnowledgeCandidates.length} deterministic knowledge candidate(s): ${resolvedKnowledgeCandidates.map((candidate) => `${candidate.id}:${candidate.title}`).join(', ')}`);
+    } else if (shouldQueryLocalKnowledge) {
+      console.log(`📚 [HANDLER] Knowledge tool not attached because no deterministic candidates matched`);
+      console.log(`📚 [HANDLER] No deterministic knowledge candidates matched this message`);
     } else {
-      console.log(`📚 [HANDLER] Knowledge graph will NOT be queried (no knowledge intent detected)`);
+      console.log(`📚 [HANDLER] Local knowledge base tool is disabled or has no documents`);
+    }
+
+    if (shouldQueryCollectiveKnowledge) {
+      console.log('📚 [HANDLER] Collective knowledge queries are available through the orchestrator');
     }
 
     // Log if multimodal (images or videos)
@@ -350,6 +327,12 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       processedVideos = undefined;
     }
 
+    let collectiveKnowledgeContext: string | undefined;
+    if (shouldQueryCollectiveKnowledge && requestCollectiveKnowledge) {
+      console.log('📚 [HANDLER] Prefetching collective knowledge from orchestrator');
+      collectiveKnowledgeContext = await requestCollectiveKnowledge(processedContent);
+    }
+
     // Add user message to conversation history (use processed content if vision was used)
     if (userId && username) {
       conversationHistoryService.addMessage(userId, guildId, username, 'user', processedContent);
@@ -361,7 +344,20 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       : '';
 
     // Build final turns: channel history (as real turns) + current message
-    const currentMessageTurn: ChatMessage = { role: 'user', content: processedContent };
+    const currentMessageTurn: ChatMessage = currentMessageSpeaker
+      ? channelHistoryService.convertMessageToTurn(
+          {
+            id: 'current-message',
+            authorId: currentMessageSpeaker.authorId,
+            authorUsername: currentMessageSpeaker.authorName,
+            content: processedContent,
+            timestamp: new Date(),
+            isBot: currentMessageSpeaker.isBot,
+          },
+          currentMessageSpeaker.currentBotId,
+          currentMessageSpeaker.format || 'default'
+        )
+      : { role: 'user', content: processedContent };
     const finalTurns: ChatMessage[] = [
       ...(channelMessages || []),
       currentMessageTurn,
@@ -371,8 +367,9 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
     const response = await aiService.createChatCompletion({
       messages: finalTurns,
       enableSearch: shouldSearch,
-      enableKnowledgeGraph: shouldQueryKnowledge,
-      knowledgeQuery: processedContent, // Use processed content for knowledge query
+      enableKnowledgeGraph: shouldQueryLocalKnowledge,
+      knowledgeCandidates: resolvedKnowledgeCandidates,
+      collectiveKnowledgeContext,
       images: processedImages, // Only pass images if not using vision secondary model
       videos: processedVideos, // Only pass videos if not using vision secondary model
       textAttachments,
@@ -383,10 +380,13 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       mentionedUsers,
       replyContext,
       boredomAction,
+      orchestratorContextNote,
       conversationSummary: conversationSummary || undefined,
       getUserListeningActivity,
       orchestratorEventId,
+      orchestratorTurnId,
       requestFollowUp,
+      requestCollectiveKnowledge,
     });
 
     // Extract reactions from the response

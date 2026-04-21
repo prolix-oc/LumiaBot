@@ -12,6 +12,14 @@ export interface ChannelMessage {
   isBot: boolean;
 }
 
+type TurnFormat = 'default' | 'orchestrator';
+
+interface PromptTurn {
+  role: 'user' | 'assistant';
+  content: string;
+  speakerKey: string;
+}
+
 export class ChannelHistoryService {
   private readonly maxMessages: number;
   private readonly maxMessageLength: number;
@@ -19,6 +27,63 @@ export class ChannelHistoryService {
   constructor() {
     this.maxMessages = config.channel.maxHistoryLength;
     this.maxMessageLength = 200; // Truncate long messages
+  }
+
+  private escapeAttribute(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  private buildPromptTurn(message: ChannelMessage, currentBotId?: string, format: TurnFormat = 'default'): PromptTurn {
+    const isCurrentBot = message.isBot && message.authorId === currentBotId;
+
+    if (isCurrentBot) {
+      return {
+        role: 'assistant',
+        content: message.content,
+        speakerKey: `assistant:${message.authorId}`,
+      };
+    }
+
+    if (format === 'orchestrator') {
+      const tagName = message.isBot ? 'orchestrator-bot-message' : 'orchestrator-user-message';
+      const speaker = this.escapeAttribute(message.authorUsername || (message.isBot ? 'Unknown Bot' : 'Unknown User'));
+
+      return {
+        role: 'user',
+        content: `<${tagName} speaker="${speaker}" authorId="${message.authorId}">\n${message.content}\n</${tagName}>`,
+        speakerKey: `user:${message.isBot ? 'bot' : 'human'}:${message.authorId}`,
+      };
+    }
+
+    let displayName = message.authorUsername;
+    if (message.isBot && message.authorId !== currentBotId) {
+      displayName = displayName.replace(/\s*Lumia\s*/gi, '').trim() || 'Other Bot';
+    }
+
+    return {
+      role: 'user',
+      content: `[${displayName}]: ${message.content}`,
+      speakerKey: `user:${message.isBot ? 'bot' : 'human'}:${message.authorId}`,
+    };
+  }
+
+  private mergePromptTurns(turns: PromptTurn[]): ChatMessage[] {
+    const merged: Array<ChatMessage & { speakerKey: string }> = [];
+
+    for (const turn of turns) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === turn.role && last.speakerKey === turn.speakerKey && typeof last.content === 'string') {
+        last.content += '\n\n' + turn.content;
+      } else {
+        merged.push({ role: turn.role, content: turn.content, speakerKey: turn.speakerKey });
+      }
+    }
+
+    return merged.map(({ speakerKey: _speakerKey, ...message }) => message);
   }
 
   /**
@@ -52,19 +117,26 @@ export class ChannelHistoryService {
         }
 
         // Skip empty messages
-        if (!message.content.trim() && message.attachments.size === 0) {
+        if (!message.content.trim() && message.attachments.size === 0 && message.stickers.size === 0) {
           return;
         }
 
-        // Build content including attachment info
+        // Build content including attachment and sticker info
         let content = message.content;
+        const annotations: string[] = [];
         if (message.attachments.size > 0) {
-          const attachmentInfo = message.attachments.map(att => {
+          annotations.push(...message.attachments.map(att => {
             if (att.contentType?.startsWith('image/')) return '[image]';
             if (att.contentType?.startsWith('video/')) return '[video]';
             return '[file]';
-          }).join(' ');
-          content = content ? `${content} ${attachmentInfo}` : attachmentInfo;
+          }));
+        }
+        if (message.stickers.size > 0) {
+          annotations.push(...message.stickers.map(s => `[sticker: ${s.name}]`));
+        }
+        if (annotations.length > 0) {
+          const annotationInfo = annotations.join(' ');
+          content = content ? `${content} ${annotationInfo}` : annotationInfo;
         }
 
         // Truncate very long messages
@@ -108,35 +180,8 @@ export class ChannelHistoryService {
       return [];
     }
 
-    // First pass: assign roles and build display names
-    const rawTurns: { role: 'user' | 'assistant'; content: string }[] = messages.map(msg => {
-      const isCurrentBot = msg.isBot && msg.authorId === currentBotId;
-
-      if (isCurrentBot) {
-        return { role: 'assistant' as const, content: msg.content };
-      }
-
-      // For other bots, strip "Lumia" branding to prevent identity confusion
-      let displayName = msg.authorUsername;
-      if (msg.isBot && msg.authorId !== currentBotId) {
-        displayName = displayName.replace(/\s*Lumia\s*/gi, '').trim() || 'Other Bot';
-      }
-
-      return { role: 'user' as const, content: `[${displayName}]: ${msg.content}` };
-    });
-
-    // Second pass: merge consecutive same-role messages
-    const merged: ChatMessage[] = [];
-    for (const turn of rawTurns) {
-      const last = merged[merged.length - 1];
-      if (last && last.role === turn.role && typeof last.content === 'string') {
-        last.content += '\n' + turn.content;
-      } else {
-        merged.push({ role: turn.role, content: turn.content });
-      }
-    }
-
-    return merged;
+    const rawTurns = messages.map((message) => this.buildPromptTurn(message, currentBotId, 'default'));
+    return this.mergePromptTurns(rawTurns);
   }
 
   /**
@@ -153,7 +198,38 @@ export class ChannelHistoryService {
       isBot: m.isBot,
     }));
 
-    return this.convertToTurns(channelMessages, currentBotId);
+    const rawTurns = channelMessages.map((message) => this.buildPromptTurn(message, currentBotId, 'orchestrator'));
+    return this.mergePromptTurns(rawTurns);
+  }
+
+  convertMessageToTurn(
+    message: Pick<ChannelMessage, 'id' | 'authorId' | 'authorUsername' | 'content' | 'timestamp' | 'isBot'>,
+    currentBotId?: string,
+    format: TurnFormat = 'default'
+  ): ChatMessage {
+    const channelMessage: ChannelMessage = {
+      id: message.id,
+      authorId: message.authorId,
+      authorUsername: message.authorUsername,
+      content: message.content,
+      timestamp: message.timestamp instanceof Date ? message.timestamp : new Date(message.timestamp),
+      isBot: message.isBot,
+    };
+
+    const { role, content } = this.buildPromptTurn(channelMessage, currentBotId, format);
+    return { role, content };
+  }
+
+  convertOrchestratorMessageToTurn(message: ContextMessage, currentBotId?: string): ChatMessage {
+    const { role, content } = this.buildPromptTurn({
+      id: message.id,
+      authorId: message.authorId,
+      authorUsername: message.authorName,
+      content: message.content,
+      timestamp: message.timestamp instanceof Date ? message.timestamp : new Date(message.timestamp),
+      isBot: message.isBot,
+    }, currentBotId, 'orchestrator');
+    return { role, content };
   }
 }
 

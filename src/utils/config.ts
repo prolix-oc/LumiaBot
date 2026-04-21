@@ -1,3 +1,11 @@
+function parseKnowledgeSourceMode(value: string | undefined): 0 | 1 | 2 {
+  const parsed = Number.parseInt(value || '0', 10);
+  if (parsed === 1 || parsed === 2) {
+    return parsed;
+  }
+  return 0;
+}
+
 export const config = {
   discord: {
     token: process.env.DISCORD_TOKEN!,
@@ -7,6 +15,7 @@ export const config = {
   },
   bot: {
     name: process.env.BOT_NAME || 'Bad Kitty',
+    familyName: process.env.BOT_FAMILY_NAME || '',
     ownerName: process.env.BOT_OWNER_NAME || 'Prolix',
     ownerId: process.env.BOT_OWNER_ID || '944783522059673691',
     ownerUsername: process.env.BOT_OWNER_USERNAME || 'prolix_oc',
@@ -89,6 +98,9 @@ export const config = {
   thinking: {
     enabled: process.env.THINKING_ENABLED !== 'false', // default: true
   },
+  knowledge: {
+    sourceMode: parseKnowledgeSourceMode(process.env.KNOWLEDGE_GRAPH_SOURCE_MODE),
+  },
   orchestrator: {
     // Optional: Enable orchestrator integration for multi-bot coordination
     enabled: process.env.ORCHESTRATOR_ENABLED === 'true',
@@ -97,6 +109,7 @@ export const config = {
     // Unique bot identifier for the orchestrator
     botId: process.env.ORCHESTRATOR_BOT_ID || process.env.DISCORD_CLIENT_ID || 'lumia-bot',
     botName: process.env.ORCHESTRATOR_BOT_NAME || process.env.BOT_NAME || 'LumiaBot',
+    familyName: process.env.COUNCIL_FAMILY_NAME || process.env.BOT_FAMILY_NAME || '',
     // Reconnection settings
     reconnectIntervalMs: parseInt(process.env.ORCHESTRATOR_RECONNECT_INTERVAL || '5000'),
     maxReconnectAttempts: parseInt(process.env.ORCHESTRATOR_MAX_RECONNECT || '10'),
@@ -119,7 +132,7 @@ export function isDeepSeekModel(): boolean {
 
 export function isMoonshotThinkingModel(): boolean {
   const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
-  return (model.includes('kimi') || model.includes('moonshot')) && model.includes('thinking');
+  return (model.includes('kimi') || model.includes('moonshot')) && (model.includes('thinking') || model.includes('k2.5') || model.includes('k2.6'));
 }
 
 export function isOpenRouterProvider(): boolean {
@@ -134,6 +147,11 @@ export function isGLMModel(): boolean {
 export function isGeminiFlashModel(): boolean {
   const model = (config.openai.modelAlias || config.openai.model).toLowerCase();
   return (model.includes('gemini-3') || model.includes('gemini3')) && model.includes('flash');
+}
+
+export function isMoonshotProvider(): boolean {
+  const baseUrl = (config.openai.baseUrl || '').toLowerCase();
+  return baseUrl.includes('moonshot.cn') || baseUrl.includes('moonshot.ai');
 }
 
 export function isGeminiProModel(): boolean {

@@ -169,17 +169,11 @@ const command: Command = {
         case 'list': {
           const topic = interaction.options.getString('topic');
           let documents;
-          
+
           if (topic) {
-            documents = knowledgeGraphService.getDocumentsByTopic(topic, 20);
+            documents = knowledgeGraphService.getDocumentsByTopic(topic, 50);
           } else {
-            // Get all documents (limit to 20)
-            const topics = knowledgeGraphService.listTopics();
-            documents = [];
-            for (const t of topics.slice(0, 5)) {
-              const docs = knowledgeGraphService.getDocumentsByTopic(t, 5);
-              documents.push(...docs);
-            }
+            documents = knowledgeGraphService.getAllDocuments(50);
           }
 
           if (documents.length === 0) {

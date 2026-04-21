@@ -34,7 +34,7 @@ const command: Command = {
 
   async execute(interaction: ChatInputCommandInteraction) {
     const message = interaction.options.getString('message', true);
-    const enableSearch = interaction.options.getBoolean('search') ?? false;
+    const enableSearch = interaction.options.getBoolean('search');
     const imageAttachment = interaction.options.getAttachment('image');
     const videoAttachment = interaction.options.getAttachment('video');
     
@@ -66,7 +66,7 @@ const command: Command = {
             content: message,
           },
         ],
-        enableSearch,
+        enableSearch: enableSearch === null ? undefined : enableSearch,
         images: imageUrls,
         videos: videoUrls,
         userId: interaction.user.id,

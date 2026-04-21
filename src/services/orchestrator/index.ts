@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import { randomUUID } from 'node:crypto';
 import type {
   MessageContext,
   WebSocketMessage,
@@ -9,15 +10,24 @@ import type {
   ResponseRequestPayload,
   FollowUpRequestPayload,
   FollowUpAckPayload,
+  TurnClaimPayload,
+  TurnLeaseRenewedPayload,
   ErrorPayload,
   LumiaBotConfig,
   ResponseHandler,
   TypingCallback,
+  CollectiveKnowledgeQueryPayload,
+  CollectiveKnowledgeLookupRequestPayload,
+  CollectiveKnowledgeLookupResponsePayload,
+  CollectiveKnowledgeResultPayload,
+  CollectiveKnowledgeCandidate,
 } from './types';
+import { orchestratorTurnJournal } from './turn-journal';
 
 export class LumiaBotIntegration {
   private ws: WebSocket | null = null;
   private config: Required<LumiaBotConfig>;
+  private instanceId: string;
   private isConnected: boolean = false;
   private reconnectAttempts: number = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -29,16 +39,40 @@ export class LumiaBotIntegration {
   private onConnectCallback: (() => void) | null = null;
   private responseReadyCallback: ((eventId: string, response: string) => void) | null = null;
   private typingCallback: TypingCallback | null = null;
-  private pendingFollowUps: Map<string, { resolve: (result: FollowUpAckPayload) => void; timeout: ReturnType<typeof setTimeout> }> = new Map();
-  private responseMessageIds: Map<string, string> = new Map(); // eventId -> Discord message ID
+  private pendingFollowUps: Map<string, { eventId: string; resolve: (result: FollowUpAckPayload) => void; timeout: ReturnType<typeof setTimeout> }> = new Map();
+  private pendingCollectiveKnowledgeQueries: Map<string, { resolve: (result: CollectiveKnowledgeResultPayload) => void; timeout: ReturnType<typeof setTimeout> }> = new Map();
+  private completedFollowUps: Map<string, { payload: FollowUpAckPayload; completedAt: number }> = new Map();
+  private responseMessageIds: Map<string, string> = new Map(); // turnId -> Discord message ID
+  private leaseRenewalTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
+  private inFlightTurns: Set<string> = new Set();
+  private completedTurns: Map<string, { eventId: string; responseContent: string; responseMessageId?: string; completedAt: number }> = new Map();
+  private collectiveKnowledgeHandler: ((payload: CollectiveKnowledgeLookupRequestPayload) => Promise<CollectiveKnowledgeCandidate[]>) | null = null;
 
   constructor(config: LumiaBotConfig) {
     this.config = {
       reconnectIntervalMs: 5000,
       maxReconnectAttempts: 10,
       metadata: {},
+      instanceId: config.instanceId || randomUUID(),
       ...config,
     };
+    this.instanceId = this.config.instanceId;
+
+    setInterval(() => {
+      const staleThreshold = Date.now() - 10 * 60 * 1000;
+
+      for (const [turnId, completed] of this.completedTurns.entries()) {
+        if (completed.completedAt < staleThreshold) {
+          this.completedTurns.delete(turnId);
+        }
+      }
+
+      for (const [turnId, completed] of this.completedFollowUps.entries()) {
+        if (completed.completedAt < staleThreshold) {
+          this.completedFollowUps.delete(turnId);
+        }
+      }
+    }, 60_000);
   }
 
   connect(): Promise<void> {
@@ -124,6 +158,16 @@ export class LumiaBotIntegration {
       this.ws = null;
     }
 
+    for (const timer of this.leaseRenewalTimers.values()) {
+      clearInterval(timer);
+    }
+    this.leaseRenewalTimers.clear();
+
+    for (const pending of this.pendingCollectiveKnowledgeQueries.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingCollectiveKnowledgeQueries.clear();
+
     this.isConnected = false;
     this.reconnectAttempts = 0;
   }
@@ -159,6 +203,7 @@ export class LumiaBotIntegration {
     const payload: HeartbeatPayload = {
       botId: this.config.botId,
       timestamp: new Date(),
+      instanceId: this.instanceId,
       guilds,
       status: 'online',
     };
@@ -216,6 +261,7 @@ export class LumiaBotIntegration {
       botId: this.config.botId,
       name: this.config.botName,
       token: this.config.token,
+      instanceId: this.instanceId,
       guilds: this.config.guilds,
       metadata: this.config.metadata,
     };
@@ -235,6 +281,7 @@ export class LumiaBotIntegration {
       const payload: HeartbeatPayload = {
         botId: this.config.botId,
         timestamp: new Date(),
+        instanceId: this.instanceId,
         status: 'online',
       };
 
@@ -274,13 +321,19 @@ export class LumiaBotIntegration {
         break;
       case 'response_ack':
         // Acknowledgement that our response was received
-        console.log(`[Orchestrator] Response acknowledged: ${(message.payload as any).turnId}`);
+        this.handleResponseAck(message.payload as { turnId: string; status: string; nextBotId?: string });
         break;
       case 'follow_up_ack':
         this.handleFollowUpAck(message.payload as FollowUpAckPayload);
         break;
       case 'banter_invite':
         console.log('[Orchestrator] Received banter invite');
+        break;
+      case 'collective_knowledge_request':
+        void this.handleCollectiveKnowledgeRequest(message.payload as CollectiveKnowledgeLookupRequestPayload);
+        break;
+      case 'collective_knowledge_result':
+        this.handleCollectiveKnowledgeResult(message.payload as CollectiveKnowledgeResultPayload);
         break;
       case 'error':
         console.error('[Orchestrator] Error:', (message.payload as ErrorPayload).message);
@@ -296,7 +349,29 @@ export class LumiaBotIntegration {
       guildId: payload.guildId,
       hasContext: !!payload.context,
       previousMessages: payload.context?.previousMessages?.length || 0,
+      timeoutAt: payload.timeoutAt,
+      alreadyInFlight: this.inFlightTurns.has(payload.turnId),
+      alreadyCompleted: this.completedTurns.has(payload.turnId),
     });
+
+    const completedTurn = this.completedTurns.get(payload.turnId);
+    if (completedTurn) {
+      console.warn(`[Orchestrator] Duplicate response_request for completed turn ${payload.turnId} - replaying cached completion`);
+      this.sendResponseComplete(payload.turnId, completedTurn.responseContent, completedTurn.responseMessageId);
+      return;
+    }
+
+    if (this.inFlightTurns.has(payload.turnId)) {
+      console.warn(`[Orchestrator] Duplicate response_request for in-flight turn ${payload.turnId} - ignoring replay`);
+      return;
+    }
+
+    const timeoutAt = new Date(payload.timeoutAt).getTime();
+    if (!Number.isNaN(timeoutAt) && timeoutAt < Date.now()) {
+      console.warn(`[Orchestrator] Ignoring stale response_request for turn ${payload.turnId} - timeout already elapsed`);
+      this.sendResponseComplete(payload.turnId, '');
+      return;
+    }
 
     if (!this.responseHandler) {
       console.warn('[Orchestrator] No response handler set');
@@ -316,11 +391,33 @@ export class LumiaBotIntegration {
       });
     }
 
+    this.inFlightTurns.add(payload.turnId);
+
     try {
-      console.log(`[Orchestrator] Calling response handler with eventId ${payload.eventId}...`);
+      console.log(`[Orchestrator] Calling response handler with eventId ${payload.eventId}, turnId ${payload.turnId}...`);
       
       // Call the response handler to generate the response
-      const response = await this.responseHandler(payload.context, payload.eventId);
+      const replayableTurn = orchestratorTurnJournal.getTurn(payload.turnId);
+      if (replayableTurn?.state === 'completion_sent' || replayableTurn?.state === 'acknowledged' || replayableTurn?.state === 'discord_sent') {
+        console.warn(`[Orchestrator] Duplicate response_request for persisted turn ${payload.turnId} - replaying journaled completion`);
+        if (this.typingCallback && payload.channelId && payload.guildId) {
+          this.typingCallback(payload.channelId, payload.guildId, false);
+        }
+        this.sendResponseComplete(
+          payload.turnId,
+          replayableTurn.responseText || '',
+          replayableTurn.responseMessageId,
+          payload,
+        );
+        return;
+      }
+
+      orchestratorTurnJournal.markReceived(payload, this.instanceId);
+      orchestratorTurnJournal.markClaimed(payload.turnId, payload.eventId, this.instanceId, payload);
+      this.sendTurnClaimed(payload);
+      this.startLeaseRenewal(payload);
+
+      const response = await this.responseHandler(payload);
       
       console.log(`[Orchestrator] Response handler completed, got response of ${response.length} chars`);
       
@@ -331,21 +428,39 @@ export class LumiaBotIntegration {
       }
       
       // Retrieve the Discord message ID set by client.ts after sending to Discord
-      const discordMessageId = this.responseMessageIds.get(payload.eventId);
+      const discordMessageId = this.responseMessageIds.get(payload.turnId);
       if (discordMessageId) {
-        this.responseMessageIds.delete(payload.eventId);
+        this.responseMessageIds.delete(payload.turnId);
       }
 
+      const journalTurn = orchestratorTurnJournal.getTurn(payload.turnId);
+      const resolvedResponse = journalTurn?.responseText ?? response;
+      const resolvedMessageId = journalTurn?.responseMessageId ?? discordMessageId;
+
+      this.completedTurns.set(payload.turnId, {
+        eventId: payload.eventId,
+        responseContent: resolvedResponse,
+        responseMessageId: resolvedMessageId,
+        completedAt: Date.now(),
+      });
+
       // Send the response back to the orchestrator
-      this.sendResponseComplete(payload.turnId, response, discordMessageId);
+      this.sendResponseComplete(payload.turnId, resolvedResponse, resolvedMessageId, payload);
 
       // Notify client that response is ready
       if (this.responseReadyCallback) {
         console.log(`[Orchestrator] Notifying client that response is ready for event ${payload.eventId}`);
-        this.responseReadyCallback(payload.eventId, response);
+        this.responseReadyCallback(payload.eventId, resolvedResponse);
       }
     } catch (error) {
       console.error('[Orchestrator] Response handler failed:', error);
+      orchestratorTurnJournal.markFailed(
+        payload.turnId,
+        payload.eventId,
+        this.instanceId,
+        error instanceof Error ? error.message : String(error),
+        payload,
+      );
       
       // ALWAYS stop typing indicator on error
       if (this.typingCallback && payload.channelId && payload.guildId) {
@@ -359,6 +474,9 @@ export class LumiaBotIntegration {
       if (this.responseReadyCallback) {
         this.responseReadyCallback(payload.eventId, '');
       }
+    } finally {
+      this.stopLeaseRenewal(payload.turnId);
+      this.inFlightTurns.delete(payload.turnId);
     }
   }
 
@@ -370,12 +488,109 @@ export class LumiaBotIntegration {
     this.typingCallback = callback;
   }
 
-  setResponseMessageId(eventId: string, messageId: string): void {
-    this.responseMessageIds.set(eventId, messageId);
+  setCollectiveKnowledgeHandler(handler: (payload: CollectiveKnowledgeLookupRequestPayload) => Promise<CollectiveKnowledgeCandidate[]>): void {
+    this.collectiveKnowledgeHandler = handler;
   }
 
-  private sendResponseComplete(turnId: string, responseContent: string, responseMessageId?: string): void {
-    const payload: ResponseCompletePayload = {
+  setResponseMessageId(turnId: string, messageId: string): void {
+    this.responseMessageIds.set(turnId, messageId);
+  }
+
+  requestCollectiveKnowledge(eventId: string, turnId: string, query: string, maxResults: number = 5, guildId?: string): Promise<CollectiveKnowledgeResultPayload> {
+    return new Promise((resolve) => {
+      const queryId = randomUUID();
+
+      if (!this.isConnected || !this.ws) {
+        resolve({
+          queryId,
+          eventId,
+          turnId,
+          botId: this.config.botId,
+          query,
+          results: [],
+          queriedBotIds: [],
+          respondedBotIds: [],
+        });
+        return;
+      }
+
+      const payload: CollectiveKnowledgeQueryPayload = {
+        queryId,
+        eventId,
+        turnId,
+        botId: this.config.botId,
+        query,
+        maxResults,
+        guildId,
+      };
+
+      const timeout = setTimeout(() => {
+        this.pendingCollectiveKnowledgeQueries.delete(queryId);
+        resolve({
+          queryId,
+          eventId,
+          turnId,
+          botId: this.config.botId,
+          query,
+          results: [],
+          queriedBotIds: [],
+          respondedBotIds: [],
+        });
+      }, 10000);
+
+      this.pendingCollectiveKnowledgeQueries.set(queryId, { resolve, timeout });
+      this.sendMessage({
+        type: 'collective_knowledge_query',
+        payload,
+      });
+
+      console.log(`[Orchestrator] Sent collective knowledge query ${queryId} for turn ${turnId}`, {
+        eventId,
+        query,
+        maxResults,
+      });
+    });
+  }
+
+  private async handleCollectiveKnowledgeRequest(payload: CollectiveKnowledgeLookupRequestPayload): Promise<void> {
+    let results: CollectiveKnowledgeCandidate[] = [];
+
+    if (this.collectiveKnowledgeHandler) {
+      try {
+        results = await this.collectiveKnowledgeHandler(payload);
+      } catch (error) {
+        console.error('[Orchestrator] Collective knowledge handler failed:', error);
+      }
+    }
+
+    const responsePayload: CollectiveKnowledgeLookupResponsePayload = {
+      queryId: payload.queryId,
+      eventId: payload.eventId,
+      turnId: payload.turnId,
+      botId: this.config.botId,
+      botName: this.config.botName,
+      results,
+    };
+
+    this.sendMessage({
+      type: 'collective_knowledge_response',
+      payload: responsePayload,
+    });
+  }
+
+  private handleCollectiveKnowledgeResult(payload: CollectiveKnowledgeResultPayload): void {
+    const pending = this.pendingCollectiveKnowledgeQueries.get(payload.queryId);
+    if (!pending) {
+      return;
+    }
+
+    clearTimeout(pending.timeout);
+    this.pendingCollectiveKnowledgeQueries.delete(payload.queryId);
+    pending.resolve(payload);
+  }
+
+  private sendResponseComplete(turnId: string, responseContent: string, responseMessageId?: string, requestPayload?: ResponseRequestPayload): void {
+    const completionPayload: ResponseCompletePayload = {
       turnId,
       botId: this.config.botId,
       responseContent,
@@ -384,8 +599,13 @@ export class LumiaBotIntegration {
 
     this.sendMessage({
       type: 'response_complete',
-      payload,
+      payload: completionPayload,
     });
+
+    const eventId = requestPayload?.eventId || this.completedTurns.get(turnId)?.eventId;
+    if (eventId) {
+      orchestratorTurnJournal.markCompletionSent(turnId, eventId, this.instanceId, responseContent, responseMessageId, requestPayload);
+    }
   }
 
   /**
@@ -393,7 +613,7 @@ export class LumiaBotIntegration {
    * Returns a promise that resolves with the ack payload (approved/denied).
    * Called by the LLM tool execution when the model wants to reply to another bot.
    */
-  requestFollowUp(eventId: string, targetBotId?: string, reason?: string): Promise<FollowUpAckPayload> {
+  requestFollowUp(eventId: string, turnId: string, targetBotId?: string, reason?: string): Promise<FollowUpAckPayload> {
     return new Promise((resolve, reject) => {
       if (!this.isConnected || !this.ws) {
         resolve({
@@ -405,8 +625,27 @@ export class LumiaBotIntegration {
         return;
       }
 
+      const completed = this.completedFollowUps.get(turnId)?.payload;
+      if (completed) {
+        console.log(`[Orchestrator] Reusing completed follow-up request for turn ${turnId}: ${completed.reason}`);
+        resolve(completed);
+        return;
+      }
+
+      const pending = this.pendingFollowUps.get(turnId);
+      if (pending) {
+        console.log(`[Orchestrator] Follow-up request already pending for turn ${turnId}, waiting for existing ack`);
+        const originalResolve = pending.resolve;
+        pending.resolve = (result) => {
+          originalResolve(result);
+          resolve(result);
+        };
+        return;
+      }
+
       const payload: FollowUpRequestPayload = {
         eventId,
+        turnId,
         botId: this.config.botId,
         targetBotId,
         reason,
@@ -414,23 +653,25 @@ export class LumiaBotIntegration {
 
       // Set up a timeout to avoid hanging forever
       const timeout = setTimeout(() => {
-        this.pendingFollowUps.delete(eventId);
-        resolve({
+        this.pendingFollowUps.delete(turnId);
+        const timeoutPayload: FollowUpAckPayload = {
           eventId,
           botId: this.config.botId,
           approved: false,
           reason: 'timeout',
-        });
+          turnId,
+        };
+        resolve(timeoutPayload);
       }, 10000);
 
-      this.pendingFollowUps.set(eventId, { resolve, timeout });
+      this.pendingFollowUps.set(turnId, { eventId, resolve, timeout });
 
       this.sendMessage({
         type: 'request_follow_up',
         payload,
       });
 
-      console.log(`[Orchestrator] Sent follow-up request for event ${eventId}`, {
+      console.log(`[Orchestrator] Sent follow-up request for event ${eventId}, turn ${turnId}`, {
         targetBotId,
         reason,
       });
@@ -443,12 +684,51 @@ export class LumiaBotIntegration {
       queuePosition: payload.queuePosition,
     });
 
-    const pending = this.pendingFollowUps.get(payload.eventId);
+    const followUpKey = payload.turnId || Array.from(this.pendingFollowUps.entries())
+      .find(([, pending]) => pending.eventId === payload.eventId)?.[0];
+
+    if (!followUpKey) {
+      if (payload.turnId) {
+        this.completedFollowUps.set(payload.turnId, {
+          payload,
+          completedAt: Date.now(),
+        });
+        console.log(`[Orchestrator] Stored late follow-up ack for turn ${payload.turnId}`);
+      }
+      return;
+    }
+
+    const pending = this.pendingFollowUps.get(followUpKey);
     if (pending) {
       clearTimeout(pending.timeout);
-      this.pendingFollowUps.delete(payload.eventId);
-      pending.resolve(payload);
+      this.pendingFollowUps.delete(followUpKey);
+      const resolvedPayload: FollowUpAckPayload = {
+        ...payload,
+        turnId: payload.turnId || followUpKey,
+      };
+      this.completedFollowUps.set(followUpKey, {
+        payload: resolvedPayload,
+        completedAt: Date.now(),
+      });
+      pending.resolve(resolvedPayload);
     }
+  }
+
+  private handleResponseAck(payload: { turnId: string; status: string; nextBotId?: string }): void {
+    console.log(`[Orchestrator] Response acknowledged: ${payload.turnId} (${payload.status})`, {
+      nextBotId: payload.nextBotId,
+    });
+
+    orchestratorTurnJournal.markAcknowledged(payload.turnId);
+
+    this.sendMessage({
+      type: 'response_ack_received',
+      payload: {
+        turnId: payload.turnId,
+        botId: this.config.botId,
+        receivedAt: new Date(),
+      },
+    });
   }
 
   private sendMessage(message: any): void {
@@ -457,9 +737,85 @@ export class LumiaBotIntegration {
     }
   }
 
+  private sendTurnClaimed(payload: ResponseRequestPayload): void {
+    if (!payload.leaseId) {
+      return;
+    }
+
+    const claimPayload: TurnClaimPayload = {
+      turnId: payload.turnId,
+      eventId: payload.eventId,
+      botId: this.config.botId,
+      instanceId: this.instanceId,
+      leaseId: payload.leaseId,
+    };
+
+    this.sendMessage({
+      type: 'turn_claimed',
+      payload: claimPayload,
+    });
+  }
+
+  private sendTurnLeaseRenewed(payload: ResponseRequestPayload): void {
+    if (!payload.leaseId) {
+      return;
+    }
+
+    const renewalPayload: TurnLeaseRenewedPayload = {
+      turnId: payload.turnId,
+      eventId: payload.eventId,
+      botId: this.config.botId,
+      instanceId: this.instanceId,
+      leaseId: payload.leaseId,
+    };
+
+    this.sendMessage({
+      type: 'turn_lease_renewed',
+      payload: renewalPayload,
+    });
+  }
+
+  private startLeaseRenewal(payload: ResponseRequestPayload): void {
+    if (!payload.leaseId) {
+      return;
+    }
+
+    this.stopLeaseRenewal(payload.turnId);
+
+    const initialExpiry = payload.leaseExpiresAt ? new Date(payload.leaseExpiresAt).getTime() : NaN;
+    const remainingMs = Number.isNaN(initialExpiry) ? 15000 : Math.max(3000, initialExpiry - Date.now());
+    const renewEveryMs = Math.max(2000, Math.min(5000, Math.floor(remainingMs / 2)));
+
+    const timer = setInterval(() => {
+      if (!this.inFlightTurns.has(payload.turnId)) {
+        this.stopLeaseRenewal(payload.turnId);
+        return;
+      }
+
+      this.sendTurnLeaseRenewed(payload);
+    }, renewEveryMs);
+
+    this.leaseRenewalTimers.set(payload.turnId, timer);
+  }
+
+  private stopLeaseRenewal(turnId: string): void {
+    const timer = this.leaseRenewalTimers.get(turnId);
+    if (!timer) {
+      return;
+    }
+
+    clearInterval(timer);
+    this.leaseRenewalTimers.delete(turnId);
+  }
+
   private handleDisconnect(): void {
     this.isConnected = false;
 
+    for (const timer of this.leaseRenewalTimers.values()) {
+      clearInterval(timer);
+    }
+    this.leaseRenewalTimers.clear();
+    
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
@@ -469,6 +825,11 @@ export class LumiaBotIntegration {
       clearTimeout(this.guildUpdateRetryTimer);
       this.guildUpdateRetryTimer = null;
     }
+
+    for (const pending of this.pendingCollectiveKnowledgeQueries.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingCollectiveKnowledgeQueries.clear();
 
     if (this.reconnectAttempts < this.config.maxReconnectAttempts) {
       this.reconnectAttempts++;
@@ -486,6 +847,10 @@ export class LumiaBotIntegration {
 
   isConnectedToOrchestrator(): boolean {
     return this.isConnected;
+  }
+
+  getInstanceId(): string {
+    return this.instanceId;
   }
 
   /**

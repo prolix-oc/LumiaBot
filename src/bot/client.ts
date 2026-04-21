@@ -1,14 +1,16 @@
-import { Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember } from 'discord.js';
+import { Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember, StickerFormatType } from 'discord.js';
 import { config } from '../utils/config';
 import { shouldTriggerBot, extractMessageContent, handleMessage, extractTriggerKeywords } from '../services/message-handler';
 import { boredomService, getRandomBoredomMessage } from '../services/boredom';
 import { channelHistoryService } from '../services/channel-history';
-import { getErrorMessage } from '../services/prompts';
+import { getErrorMessage, getTriggerKeywords } from '../services/prompts';
 import { userActivityService } from '../services/user-activity';
 import { pageExtractorService } from '../services/page-extractor';
+import { knowledgeGraphService } from '../services/knowledge-graph';
 import type { ChatInputCommandInteraction } from 'discord.js';
 import { LumiaBotIntegration } from '../services/orchestrator';
-import type { MessageContext } from '../services/orchestrator/types';
+import { orchestratorTurnJournal } from '../services/orchestrator/turn-journal';
+import type { MessageContext, ReplyContext, MediaAttachment, TextAttachment, ResponseRequestPayload, CollectiveKnowledgeResultPayload } from '../services/orchestrator/types';
 
 export interface Command {
   data: {
@@ -17,6 +19,70 @@ export interface Command {
     toJSON: () => unknown;
   };
   execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
+}
+
+interface OrchestratorQueuedInfo {
+  message: Message;
+  replyContext?: ReplyContext;
+  imageUrls: string[];
+  videoUrls: MediaAttachment[];
+  textAttachments: TextAttachment[];
+}
+
+/**
+ * Categorize stickers on a Discord message for the AI pipeline.
+ * PNG/APNG stickers go to image inputs (APNG only renders frame 1 in vision models, but
+ * the sticker name covers the animation intent). GIF stickers go to the video pipeline
+ * so they hit the same GIF→WebM conversion path as regular GIF attachments. Lottie
+ * stickers are JSON vector animations — nothing rasterizes them server-side, so we fall
+ * back to a text hint using the sticker name. Every sticker also contributes a name hint
+ * so the bot has context even when the media can't be ingested.
+ */
+function extractStickerMedia(
+  message: Message,
+  logPrefix: string,
+): {
+  imageUrls: string[];
+  videoUrls: { url: string; mimeType?: string }[];
+  stickerHints: string[];
+} {
+  const imageUrls: string[] = [];
+  const videoUrls: { url: string; mimeType?: string }[] = [];
+  const stickerHints: string[] = [];
+
+  if (message.stickers.size === 0) {
+    return { imageUrls, videoUrls, stickerHints };
+  }
+
+  for (const sticker of message.stickers.values()) {
+    const name = sticker.name || 'unnamed';
+    switch (sticker.format) {
+      case StickerFormatType.GIF:
+        videoUrls.push({ url: sticker.url, mimeType: 'image/gif' });
+        stickerHints.push(`[Animated sticker: ${name}]`);
+        console.log(`🎬 [${logPrefix}] GIF sticker: ${name} (${sticker.url})`);
+        break;
+      case StickerFormatType.APNG:
+        imageUrls.push(sticker.url);
+        stickerHints.push(`[Animated sticker: ${name}]`);
+        console.log(`🖼️  [${logPrefix}] APNG sticker: ${name} (${sticker.url})`);
+        break;
+      case StickerFormatType.PNG:
+        imageUrls.push(sticker.url);
+        stickerHints.push(`[Sticker: ${name}]`);
+        console.log(`🖼️  [${logPrefix}] PNG sticker: ${name} (${sticker.url})`);
+        break;
+      case StickerFormatType.Lottie:
+        stickerHints.push(`[Lottie sticker: ${name}]`);
+        console.log(`✨ [${logPrefix}] Lottie sticker (name-only, no raster): ${name}`);
+        break;
+      default:
+        stickerHints.push(`[Sticker: ${name}]`);
+        console.log(`❓ [${logPrefix}] Unknown sticker format (${sticker.format}): ${name}`);
+    }
+  }
+
+  return { imageUrls, videoUrls, stickerHints };
 }
 
 // Patterns for detecting boredom opt-in/opt-out intent
@@ -82,15 +148,40 @@ function formatTimeAgo(date: Date): string {
   return `${diffDays} day${diffDays !== 1 ? 's' : ''} ago`;
 }
 
+function isReplyReferenceFailure(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+
+  const candidate = error as {
+    code?: number | string;
+    message?: string;
+    rawError?: { code?: number | string; message?: string };
+  };
+
+  const code = typeof candidate.code === 'number'
+    ? candidate.code
+    : typeof candidate.rawError?.code === 'number'
+      ? candidate.rawError.code
+      : undefined;
+
+  const message = `${candidate.message || ''} ${candidate.rawError?.message || ''}`;
+
+  return code === 10008 || message.includes('Unknown Message');
+}
+
 export class DiscordBot {
   public client: Client;
   public commands: Collection<string, Command>;
   private typingIntervals: Map<string, Timer>; // channelId -> timer
   private orchestrator?: LumiaBotIntegration;
-  private orchestratorQueue: Map<string, { message: Message; replyContext: any; imageUrls: string[]; videoUrls: { url: string; mimeType?: string }[]; textAttachments: { name: string; content: string }[] }>; // eventId -> message info
+  private orchestratorQueue: Map<string, OrchestratorQueuedInfo>; // eventId -> message info
   private channelProcessingQueue: Map<string, Promise<void>>; // per-channel sequential processing
   private processedMessageIds: Set<string>; // duplicate event guard
   private processedMessageTimers: Map<string, Timer>; // TTL cleanup for processedMessageIds
+  private repliedMessageIds: Set<string>; // cross-path guard: prevents double replies regardless of trigger path
+  private activeGenerationKeys: Set<string>; // in-flight generation guard
+  private recentGenerationKeys: Set<string>; // short TTL generation guard
 
   constructor() {
     this.client = new Client({
@@ -108,8 +199,142 @@ export class DiscordBot {
     this.channelProcessingQueue = new Map();
     this.processedMessageIds = new Set();
     this.processedMessageTimers = new Map();
+    this.repliedMessageIds = new Set();
+    this.activeGenerationKeys = new Set();
+    this.recentGenerationKeys = new Set();
     this.setupEventHandlers();
     this.setupOrchestrator();
+  }
+
+  private buildOrchestratorContextNote(context: MessageContext): string | undefined {
+    const lines: string[] = [];
+    const councilFamilyName = context.councilFamilyName || config.orchestrator.familyName || config.bot.familyName;
+
+    if (councilFamilyName) {
+      lines.push(`You are part of the ${councilFamilyName}. Cooperate with the other ${councilFamilyName} as trusted sibling bots with shared context and complementary perspectives.`);
+    }
+
+    if (context.sessionMode) {
+      lines.push(`Session mode: ${context.sessionMode}.`);
+    }
+
+    if (context.sessionPhase) {
+      lines.push(`Session phase: ${context.sessionPhase}.`);
+    }
+
+    lines.push(`You are on turn ${context.turnCount + 1} of up to ${context.maxTurns}.`);
+
+    if (context.replyingToBotName) {
+      lines.push(`You are directly replying to ${context.replyingToBotName}.`);
+      lines.push(`Treat this as bot-to-bot dialogue first: address ${context.replyingToBotName}'s point before circling back to any human.`);
+    }
+
+    if (context.nearbyBots && context.nearbyBots.length > 0) {
+      const botNames = context.nearbyBots.filter((bot) => bot.isOnline).map((bot) => bot.botName);
+      if (botNames.length > 0) {
+        lines.push(`${councilFamilyName ? `Other active ${councilFamilyName} nearby` : 'Other active bots nearby'}: ${botNames.join(', ')}.`);
+      }
+    }
+
+    if (context.sessionSummary) {
+      lines.push(`Session summary: ${context.sessionSummary}`);
+    }
+
+    if (context.shouldWrapUp) {
+      lines.push('The orchestrator thinks this exchange is approaching a natural ending, so wrap cleanly unless there is a strong new hook.');
+    }
+
+    lines.push(`Do not repeat or closely paraphrase an earlier ${councilFamilyName || 'bot'} message. Add a fresh angle, disagreement, synthesis, or question.`);
+
+    if (context.scratchpad) {
+      lines.push(`Your scratchpad: turnsTaken=${context.scratchpad.turnsTaken}, suppressedResponses=${context.scratchpad.suppressedResponses}, unansweredQuestionsSeen=${context.scratchpad.unansweredQuestionsSeen}, noveltyPressure=${context.scratchpad.noveltyPressure.toFixed(2)}.`);
+      if (context.scratchpad.privateNotes.length > 0) {
+        lines.push(`Private notes: ${context.scratchpad.privateNotes.join(' ')}`);
+      }
+      if (context.scratchpad.lastNoveltyReasons.length > 0) {
+        lines.push(`Novelty check: ${context.scratchpad.lastNoveltyReasons.join('; ')}.`);
+      }
+      if (context.scratchpad.lastImpulseReasons.length > 0) {
+        lines.push(`Why you were in the running to speak: ${context.scratchpad.lastImpulseReasons.join('; ')}.`);
+      }
+    }
+
+    if (context.recentImpulses && context.recentImpulses.length > 0) {
+      const impulseSummary = context.recentImpulses
+        .slice(0, 3)
+        .map((impulse) => `${impulse.botName}=${impulse.score.toFixed(2)}${impulse.reasons.length > 0 ? ` (${impulse.reasons.join(', ')})` : ''}`)
+        .join(' | ');
+      lines.push(`Latest impulse ranking: ${impulseSummary}`);
+    }
+
+    return lines.length > 0 ? lines.join('\n') : undefined;
+  }
+
+  private normalizeOrchestratorResponse(text: string): string {
+    return text
+      .toLowerCase()
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/[`*_~>#]/g, ' ')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private isDuplicateOrchestratorResponse(text: string, context: MessageContext): boolean {
+    const normalized = this.normalizeOrchestratorResponse(text);
+    if (!normalized) {
+      return false;
+    }
+
+    return context.previousMessages.some((message) => {
+      if (!message.isBot) {
+        return false;
+      }
+
+      return this.normalizeOrchestratorResponse(message.content) === normalized;
+    });
+  }
+
+  private formatCollectiveKnowledgeResult(result: CollectiveKnowledgeResultPayload): string {
+    if (result.queriedBotIds.length === 0) {
+      return 'Collective knowledge is unavailable because neither the orchestrator knowledge graph nor any other connected bots were available to query.';
+    }
+
+    if (result.results.length === 0) {
+      return `No matching collective knowledge was returned from the orchestrator-backed pool for "${result.query}". Queried sources: ${result.queriedBotIds.join(', ')}. Responded sources: ${result.respondedBotIds.join(', ') || 'none'}.`;
+    }
+
+    const sections = result.results.map((entry, index) => {
+      const matchedKeywords = entry.matchedKeywords.length > 0 ? entry.matchedKeywords.join(', ') : 'none';
+      const urlLine = entry.url ? `\nURL: ${entry.url}` : '';
+      return `${index + 1}. ${entry.title}\nSource bot: ${entry.sourceBotName} (${entry.sourceBotId})\nTopic: ${entry.topic}\nType: ${entry.type}\nMatched keywords: ${matchedKeywords}\nRelevance: ${entry.relevanceScore.toFixed(2)}${urlLine}\nPreview: ${entry.preview}\nExcerpt: ${entry.excerpt}`;
+    });
+
+    return `<collective-knowledge>
+Results returned from the orchestrator knowledge graph and other connected bots via the orchestrator.
+Original query: ${result.query}
+Queried sources: ${result.queriedBotIds.join(', ')}
+Responded sources: ${result.respondedBotIds.join(', ') || 'none'}
+
+${sections.join('\n\n')}
+</collective-knowledge>`;
+  }
+
+  private canUseCollectiveKnowledge(): boolean {
+    return config.knowledge.sourceMode !== 0
+      && !!this.orchestrator
+      && this.orchestrator.isConnectedToOrchestrator();
+  }
+
+  private buildCollectiveKnowledgeRequester(eventId: string, turnId: string, guildId?: string): ((query: string, maxResults?: number) => Promise<string>) | undefined {
+    const orchestrator = this.orchestrator;
+    if (!this.canUseCollectiveKnowledge() || !orchestrator) {
+      return undefined;
+    }
+
+    return async (query: string, maxResults?: number) => this.formatCollectiveKnowledgeResult(
+      await orchestrator.requestCollectiveKnowledge(eventId, turnId, query, maxResults, guildId)
+    );
   }
 
   /**
@@ -130,13 +355,22 @@ export class DiscordBot {
       botName: config.orchestrator.botName,
       token: config.discord.token,
       guilds: [],
+      metadata: {
+        triggerKeywords: getTriggerKeywords().botMention,
+        botFamilyName: config.bot.familyName || undefined,
+        councilFamilyName: config.orchestrator.familyName || undefined,
+      },
       reconnectIntervalMs: config.orchestrator.reconnectIntervalMs,
       maxReconnectAttempts: config.orchestrator.maxReconnectAttempts,
     });
 
     // Set up response handler for orchestrator
-    this.orchestrator.setResponseHandler(async (context: MessageContext, eventId: string) => {
-      return this.handleOrchestratorResponse(context, eventId);
+    this.orchestrator.setResponseHandler(async (payload: ResponseRequestPayload) => {
+      return this.handleOrchestratorResponse(payload);
+    });
+
+    this.orchestrator.setCollectiveKnowledgeHandler(async (payload) => {
+      return knowledgeGraphService.findCollectiveKnowledgeCandidates(payload.query, payload.maxResults);
     });
 
     // Set up callback for when orchestrator says we should respond.
@@ -183,25 +417,48 @@ export class DiscordBot {
   /**
    * Handle orchestrator response request - generates actual response and sends it
    */
-  private async handleOrchestratorResponse(context: MessageContext, eventId: string): Promise<string> {
+  private async handleOrchestratorResponse(payload: ResponseRequestPayload): Promise<string> {
+    const { context, eventId, turnId } = payload;
     console.log('[Orchestrator] Generating response for event', {
       eventId,
+      turnId,
       turnCount: context.turnCount,
       maxTurns: context.maxTurns,
       isBanter: context.isBanter,
     });
 
-    // Look up the original message from the queue but DON'T delete it —
-    // follow-up turns reuse the same eventId and need the Discord message object
-    // to call message.reply(). The queue entry is cleaned up when the orchestrator
-    // session ends (via responseReadyCallback) or on bot restart.
-    const queuedInfo = this.orchestratorQueue.get(eventId);
+    const queuedInfo = await this.resolveOrchestratorQueuedInfo(payload);
     if (!queuedInfo) {
-      console.error(`[Orchestrator] No queued message found for event ${eventId}`);
+      console.error(`[Orchestrator] No queued or reconstructable message found for event ${eventId}`);
       return '';
     }
 
     const { message, replyContext, imageUrls, videoUrls, textAttachments } = queuedInfo;
+    const instanceId = this.orchestrator?.getInstanceId() ?? 'unknown';
+    const generationKey = !context.replyToMessageId ? `root:${message.id}` : undefined;
+
+    const journalTurn = orchestratorTurnJournal.getTurn(turnId);
+    if (journalTurn?.responseText) {
+      if (journalTurn.state === 'discord_sent' || journalTurn.state === 'completion_sent' || journalTurn.state === 'acknowledged') {
+        console.log(`[Orchestrator] Reusing cached response for turn ${turnId} without regenerating`);
+        return journalTurn.responseText;
+      }
+
+      if (journalTurn.state === 'generated') {
+        console.log(`[Orchestrator] Replaying cached generated response for turn ${turnId}`);
+        const replayedMessage = await this.sendOrchestratorResponseToDiscord(message, context, journalTurn.responseText, eventId, turnId);
+        if (!replayedMessage) {
+          orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, '', payload);
+          return '';
+        }
+        return journalTurn.responseText;
+      }
+    }
+
+    if (generationKey && !this.beginGeneration(generationKey)) {
+      console.warn(`⚠️ [Orchestrator] Suppressing duplicate generation for message ${message.id} (event ${eventId}, turn ${turnId})`);
+      return '';
+    }
 
     // Get the last message from context
     const lastMessage = context.previousMessages[context.previousMessages.length - 1];
@@ -211,6 +468,10 @@ export class DiscordBot {
     }
 
     try {
+      orchestratorTurnJournal.markGenerating(turnId, eventId, instanceId, payload);
+
+      const isBotAuthoredTurn = lastMessage.isBot;
+
       // Extract mentioned users from the original Discord message.
       // In orchestrator mode the message content contains raw <@id> patterns;
       // resolving them here gives the AI system prompt the "USERS MENTIONED"
@@ -253,34 +514,8 @@ export class DiscordBot {
         config.orchestrator.botId
       );
 
-      // For banter mode, inject metadata into the first user turn so the model
-      // understands the multi-bot discussion context
-      if (context.isBanter && historyMessages.length > 0) {
-        const metadataLines: string[] = [];
-        metadataLines.push(`This is turn ${context.turnCount + 1} of ${context.maxTurns} in a multi-bot discussion.`);
-        if (context.replyingToBotName) {
-          metadataLines.push(`You are replying to ${context.replyingToBotName}'s message.`);
-        }
-        if (context.nearbyBots && context.nearbyBots.length > 0) {
-          const otherBotNames = context.nearbyBots
-            .filter(b => b.isOnline && b.botId !== context.respondingBotId)
-            .map(b => b.botName);
-          if (otherBotNames.length > 0) {
-            metadataLines.push(`Other bots present: ${otherBotNames.join(', ')}`);
-          }
-        }
-        if (context.turnCount >= context.maxTurns - 1) {
-          metadataLines.push(`This is your last turn — wrap up naturally.`);
-        }
-
-        const banterContext = `[Banter context: ${metadataLines.join(' ')}]\n\n`;
-        // Prepend banter metadata to the first turn's content
-        if (orchestratorTurns.length > 0 && typeof orchestratorTurns[0]!.content === 'string') {
-          orchestratorTurns[0]!.content = banterContext + orchestratorTurns[0]!.content;
-        } else if (orchestratorTurns.length === 0) {
-          orchestratorTurns = [{ role: 'user', content: banterContext.trim() }];
-        }
-      }
+      const orchestratorContextNote = this.buildOrchestratorContextNote(context);
+      const requestCollectiveKnowledge = this.buildCollectiveKnowledgeRequester(eventId, turnId, message.guildId || undefined);
 
       // Create a working getUserListeningActivity callback using the guild
       // from the original Discord message, matching the non-orchestrator path.
@@ -304,8 +539,8 @@ export class DiscordBot {
         ? await pageExtractorService.extractPagesFromMessage(lastMessage.content)
         : [];
 
-      // In banter mode, set replyContext so the AI knows it's responding to a specific bot
-      const effectiveReplyContext = context.isBanter && context.replyingToBotName
+      // In orchestrator mode, if another bot just spoke, strongly frame this as a reply to that bot.
+      const effectiveReplyContext = context.replyingToBotName
         ? {
             isReply: true,
             isReplyToLumia: false,
@@ -323,56 +558,177 @@ export class DiscordBot {
           : undefined;
 
       // Generate response using the existing message handler
-      const response = await handleMessage({
+      let response = await handleMessage({
         content: lastMessage.content,
         imageUrls,
         videoUrls,
         textAttachments,
         pageContents: orchestratorPageContents.length > 0 ? orchestratorPageContents : undefined,
-        userId: lastMessage.authorId,
-        username: lastMessage.authorName,
+        userId: isBotAuthoredTurn ? undefined : lastMessage.authorId,
+        username: isBotAuthoredTurn ? undefined : lastMessage.authorName,
         guildId: message.guildId || 'dm',
         mentionedUsers,
         replyContext: effectiveReplyContext,
         channelMessages: orchestratorTurns.length > 0 ? orchestratorTurns : undefined,
+        orchestratorContextNote,
+        currentMessageSpeaker: {
+          authorId: lastMessage.authorId,
+          authorName: lastMessage.authorName,
+          isBot: lastMessage.isBot,
+          format: 'orchestrator',
+          currentBotId: this.client.user?.id,
+        },
         getUserListeningActivity,
         // Orchestrator follow-up support: allow the LLM to request another turn
         orchestratorEventId: eventId,
+        orchestratorTurnId: turnId,
         requestFollowUp: this.orchestrator
-          ? (evtId, targetBotId, reason) => this.orchestrator!.requestFollowUp(evtId, targetBotId, reason)
+          ? (evtId, currentTurnId, targetBotId, reason) => this.orchestrator!.requestFollowUp(evtId, currentTurnId, targetBotId, reason)
           : undefined,
+        requestCollectiveKnowledge,
       });
+
+      if (response.text && this.isDuplicateOrchestratorResponse(response.text, context)) {
+        console.warn(`[Orchestrator] Duplicate-looking response detected for turn ${turnId}; retrying with anti-repeat note`);
+
+        response = await handleMessage({
+          content: lastMessage.content,
+          imageUrls,
+          videoUrls,
+          textAttachments,
+          pageContents: orchestratorPageContents.length > 0 ? orchestratorPageContents : undefined,
+          userId: isBotAuthoredTurn ? undefined : lastMessage.authorId,
+          username: isBotAuthoredTurn ? undefined : lastMessage.authorName,
+          guildId: message.guildId || 'dm',
+          mentionedUsers,
+          replyContext: effectiveReplyContext,
+          channelMessages: orchestratorTurns.length > 0 ? orchestratorTurns : undefined,
+          orchestratorContextNote: `${orchestratorContextNote || ''}\nYour previous draft matched an earlier ${(config.orchestrator.familyName || config.bot.familyName || 'bot')} response too closely. Reply in a meaningfully different way or stay silent rather than repeating yourself.`.trim(),
+          currentMessageSpeaker: {
+            authorId: lastMessage.authorId,
+            authorName: lastMessage.authorName,
+            isBot: lastMessage.isBot,
+            format: 'orchestrator',
+            currentBotId: this.client.user?.id,
+          },
+          getUserListeningActivity,
+          orchestratorEventId: eventId,
+          orchestratorTurnId: turnId,
+          requestFollowUp: this.orchestrator
+            ? (evtId, currentTurnId, targetBotId, reason) => this.orchestrator!.requestFollowUp(evtId, currentTurnId, targetBotId, reason)
+            : undefined,
+          requestCollectiveKnowledge,
+        });
+      }
+
+      if (response.text && this.isDuplicateOrchestratorResponse(response.text, context)) {
+        console.warn(`[Orchestrator] Suppressing repeated response for turn ${turnId} after retry`);
+        response.text = '';
+      }
+
+      orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, response.text, payload);
 
       // Send the response directly to Discord
       if (response.text && response.text.trim()) {
-        console.log(`[Orchestrator] Sending response to Discord for event ${eventId}`);
-
-        let sentMessage;
-        if (context.replyToMessageId && 'send' in message.channel) {
-          // Reply to the previous bot's message for threaded conversation
-          sentMessage = await message.channel.send({
-            content: response.text,
-            reply: { messageReference: context.replyToMessageId, failIfNotExists: false },
-          });
-        } else {
-          // First turn: reply to the original user message
-          sentMessage = await message.reply({
-            content: response.text,
-            failIfNotExists: false,
-          });
-        }
-
-        // Store the Discord message ID so the orchestrator can thread the next bot's reply
-        if (sentMessage && this.orchestrator) {
-          this.orchestrator.setResponseMessageId(eventId, sentMessage.id);
+        const sentMessage = await this.sendOrchestratorResponseToDiscord(message, context, response.text, eventId, turnId);
+        if (!sentMessage) {
+          orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, '', payload);
+          return '';
         }
       }
 
       return response.text;
     } catch (error) {
       console.error('[Orchestrator] Failed to generate or send response:', error);
+      orchestratorTurnJournal.markFailed(turnId, eventId, instanceId, error instanceof Error ? error.message : String(error), payload);
       return '';
+    } finally {
+      if (generationKey) {
+        this.endGeneration(generationKey);
+      }
     }
+  }
+
+  private async resolveOrchestratorQueuedInfo(payload: ResponseRequestPayload): Promise<OrchestratorQueuedInfo | undefined> {
+    const queuedInfo = this.orchestratorQueue.get(payload.eventId);
+    if (queuedInfo) {
+      return queuedInfo;
+    }
+
+    if (!payload.eventSnapshot) {
+      return undefined;
+    }
+
+    const message = await this.fetchOrchestratorMessageFromSnapshot(payload.eventSnapshot);
+    if (!message) {
+      return undefined;
+    }
+
+    return {
+      message,
+      replyContext: payload.eventSnapshot.replyContext,
+      imageUrls: payload.eventSnapshot.imageUrls || [],
+      videoUrls: payload.eventSnapshot.videoUrls || [],
+      textAttachments: payload.eventSnapshot.textAttachments || [],
+    };
+  }
+
+  private async fetchOrchestratorMessageFromSnapshot(snapshot: NonNullable<ResponseRequestPayload['eventSnapshot']>): Promise<Message | null> {
+    try {
+      const channel = await this.client.channels.fetch(snapshot.channelId);
+      if (!channel || !('messages' in channel)) {
+        console.warn(`[Orchestrator] Cannot reconstruct message ${snapshot.messageId} - channel missing message manager`);
+        return null;
+      }
+
+      const fetchedMessage = await channel.messages.fetch(snapshot.messageId);
+      return fetchedMessage;
+    } catch (error) {
+      console.error(`[Orchestrator] Failed to reconstruct message ${snapshot.messageId}:`, error);
+      return null;
+    }
+  }
+
+  private async sendOrchestratorResponseToDiscord(
+    message: Message,
+    context: MessageContext,
+    responseText: string,
+    eventId: string,
+    turnId: string,
+  ): Promise<Message | null> {
+    if (!context.replyToMessageId && this.hasAlreadyReplied(message.id)) {
+      console.warn(`⚠️ [Orchestrator] Suppressing duplicate reply for message ${message.id} (orchestrator path blocked by cross-path guard)`);
+      return null;
+    }
+
+    console.log(`[Orchestrator] Sending response to Discord for event ${eventId}, turn ${turnId}`);
+
+    let sentMessage;
+    if (context.replyToMessageId && 'send' in message.channel) {
+      sentMessage = await message.channel.send({
+        content: responseText,
+        reply: { messageReference: context.replyToMessageId, failIfNotExists: false },
+      });
+    } else {
+      sentMessage = await message.reply({
+        content: responseText,
+        failIfNotExists: false,
+      });
+    }
+
+    if (sentMessage && this.orchestrator) {
+      console.log(`[Orchestrator] Sent Discord reply for turn ${turnId}: ${sentMessage.id}`);
+      this.orchestrator.setResponseMessageId(turnId, sentMessage.id);
+      orchestratorTurnJournal.markDiscordSent(
+        turnId,
+        eventId,
+        this.orchestrator.getInstanceId(),
+        responseText,
+        sentMessage.id,
+      );
+    }
+
+    return sentMessage;
   }
 
   /**
@@ -392,6 +748,14 @@ export class DiscordBot {
     // If multiple bots are @mentioned, use orchestrator
     if (mentionedBots.size > 1) {
       return true;
+    }
+
+    // If this bot is the only @mentioned bot, handle directly.
+    // The user explicitly targeted this bot, so orchestrator coordination
+    // is unnecessary and can cause double replies via race conditions
+    // (another keyword-triggered bot could create a banter session).
+    if (mentionedBots.size === 1 && mentionedBots.has(botId)) {
+      return false;
     }
 
     // Check for trigger keywords
@@ -420,6 +784,35 @@ export class DiscordBot {
     }
 
     return false;
+  }
+
+  /**
+   * Cross-path reply guard: returns true if we've already replied to this message.
+   * Prevents double replies regardless of which trigger path (direct/orchestrator) runs.
+   */
+  private hasAlreadyReplied(messageId: string): boolean {
+    if (this.repliedMessageIds.has(messageId)) {
+      return true;
+    }
+    this.repliedMessageIds.add(messageId);
+    // Auto-cleanup after 2 minutes
+    setTimeout(() => this.repliedMessageIds.delete(messageId), 120_000);
+    return false;
+  }
+
+  private beginGeneration(key: string): boolean {
+    if (this.activeGenerationKeys.has(key) || this.recentGenerationKeys.has(key)) {
+      return false;
+    }
+
+    this.activeGenerationKeys.add(key);
+    this.recentGenerationKeys.add(key);
+    setTimeout(() => this.recentGenerationKeys.delete(key), 120_000);
+    return true;
+  }
+
+  private endGeneration(key: string): void {
+    this.activeGenerationKeys.delete(key);
   }
 
   /**
@@ -691,10 +1084,21 @@ export class DiscordBot {
             }
           }
           
+          // Extract stickers from the referenced message
+          const referencedStickerMedia = extractStickerMedia(referencedMessage, 'CLIENT');
+          embeddedImages.push(...referencedStickerMedia.imageUrls);
+          embeddedVideos.push(...referencedStickerMedia.videoUrls);
+
+          const originalContentWithStickers = referencedStickerMedia.stickerHints.length > 0
+            ? (referencedMessage.content
+                ? `${referencedMessage.content} ${referencedStickerMedia.stickerHints.join(' ')}`
+                : referencedStickerMedia.stickerHints.join(' '))
+            : referencedMessage.content;
+
           replyContext = {
             isReply: true,
             isReplyToLumia,
-            originalContent: referencedMessage.content,
+            originalContent: originalContentWithStickers,
             originalTimestamp: formatTimeAgo(referencedMessage.createdAt),
             originalAuthor: referencedMessage.author.username,
             embeddedContent: {
@@ -773,6 +1177,8 @@ export class DiscordBot {
     } | undefined,
     boredomAction: 'opted-in' | 'opted-out' | undefined,
   ): Promise<void> {
+    const generationKey = `root:${message.id}`;
+
     // Check for boredom opt-in/opt-out intent (but let LLM respond naturally)
     if (detectBoredomOptOut(message.content)) {
       const guildId = message.guildId || 'dm';
@@ -804,8 +1210,17 @@ export class DiscordBot {
     // Extract the actual message content (remove triggers if present)
     const cleanedContent = hasTrigger ? extractMessageContent(message.content, botId) : message.content;
 
+    // Categorize any stickers up front so the content guard can count them as "content"
+    // and the media arrays below can absorb them alongside regular attachments.
+    const stickerMedia = extractStickerMedia(message, 'CLIENT');
+    const contentWithStickers = stickerMedia.stickerHints.length > 0
+      ? (cleanedContent.trim()
+          ? `${cleanedContent} ${stickerMedia.stickerHints.join(' ')}`
+          : stickerMedia.stickerHints.join(' '))
+      : cleanedContent;
+
     // Don't respond if there's no actual content after removing triggers (only for explicit triggers)
-    if (hasTrigger && !cleanedContent.trim()) {
+    if (hasTrigger && !cleanedContent.trim() && stickerMedia.stickerHints.length === 0) {
       // Check if channel is still available (bot may have been kicked)
       if (!message.channel) {
         console.warn('⚠️ [CLIENT] Cannot reply - channel no longer available (bot may have been kicked)');
@@ -816,6 +1231,12 @@ export class DiscordBot {
     }
 
     try {
+      if (!this.beginGeneration(generationKey)) {
+        console.warn(`⚠️ [CLIENT] Suppressing duplicate generation for message ${message.id}`);
+        this.stopTyping(message.channelId);
+        return;
+      }
+
       // Extract image and video URLs from attachments
       const imageUrls: string[] = [];
       const videoUrls: { url: string; mimeType?: string }[] = [];
@@ -877,6 +1298,10 @@ export class DiscordBot {
           }
         }
       }
+
+      // Merge sticker-derived media into the main arrays so downstream handling is identical.
+      imageUrls.push(...stickerMedia.imageUrls);
+      videoUrls.push(...stickerMedia.videoUrls);
 
       // Identify URLs that will be scraped for page content, so we can skip their embed images
       const scrapedUrls = config.pageExtraction.enabled
@@ -984,9 +1409,15 @@ export class DiscordBot {
         ? await pageExtractorService.extractPagesFromMessage(cleanedContent)
         : [];
 
-      // Generate response (search intent detected automatically via heuristics)
+      const requestCollectiveKnowledge = this.buildCollectiveKnowledgeRequester(
+        `direct-${message.id}`,
+        `direct-${message.id}`,
+        message.guildId || undefined,
+      );
+
+      // Generate response with tool availability attached for model-directed use
       const response = await handleMessage({
-        content: cleanedContent,
+        content: contentWithStickers,
         imageUrls,
         videoUrls,
         textAttachments,
@@ -1005,10 +1436,18 @@ export class DiscordBot {
         boredomAction,
         channelMessages: channelTurns,
         getUserListeningActivity,
+        requestCollectiveKnowledge,
       });
 
       // Clear typing indicator before sending response
       this.stopTyping(message.channelId);
+
+      // Cross-path reply guard: prevent double replies if the orchestrator path
+      // also processed this message (or any other duplicate trigger).
+      if (this.hasAlreadyReplied(message.id)) {
+        console.warn(`⚠️ [CLIENT] Suppressing duplicate reply for message ${message.id} (direct path blocked by cross-path guard)`);
+        return;
+      }
 
       // Discord has a 2000 character limit for messages
       const truncatedResponse = response.text.length > 1950
@@ -1031,9 +1470,13 @@ export class DiscordBot {
           failIfNotExists: false,
         });
       } catch (replyError) {
-        // If reply fails (e.g., unknown message reference), send as regular message
-        console.warn('⚠️ [CLIENT] Reply failed, sending as regular message:', replyError);
-        const { TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel } = await import('discord.js');
+        // Only fall back when the reply target is genuinely unavailable.
+        // For generic failures, rethrow so we don't risk posting the same reply twice.
+        if (!isReplyReferenceFailure(replyError)) {
+          throw replyError;
+        }
+
+        console.warn('⚠️ [CLIENT] Reply target unavailable, sending as regular message:', replyError);
         if (message.channel instanceof TextChannel ||
             message.channel instanceof ThreadChannel ||
             message.channel instanceof NewsChannel ||
@@ -1089,6 +1532,8 @@ export class DiscordBot {
       } catch (replyError) {
         console.error('❌ [CLIENT] Failed to send error reply:', replyError);
       }
+    } finally {
+      this.endGeneration(generationKey);
     }
   }
 
@@ -1116,7 +1561,7 @@ export class DiscordBot {
    */
   private async handleOrchestratedMention(
     message: Message,
-    replyContext: any
+    replyContext?: ReplyContext
   ): Promise<void> {
     if (!this.orchestrator) return;
 
@@ -1125,26 +1570,29 @@ export class DiscordBot {
     const eventId = `evt-${message.id}`;
     const botId = this.client.user?.id;
 
-    // Get all mentioned bots from the message
+    // Determine which bot IDs to include in the orchestrator mention.
+    // If this bot is directly @mentioned, include all @mentioned bots (multi-bot coordination).
+    // If this bot is only triggered by keywords, include only itself — don't drag
+    // @mentioned bots into a banter session they may already be handling directly.
     const mentionedBots = message.mentions.users.filter(user => user.bot);
-    const mentionedBotIds = mentionedBots.map(user => user.id);
+    const isSelfMentioned = botId ? mentionedBots.has(botId) : false;
+    let mentionedBotIds: string[];
 
-    // Add this bot to the list if not already present
-    if (botId && !mentionedBotIds.includes(botId)) {
-      mentionedBotIds.push(botId);
+    if (isSelfMentioned) {
+      // Bot was @mentioned — include all mentioned bots for coordination
+      mentionedBotIds = mentionedBots.map(user => user.id);
+    } else {
+      // Bot was triggered by keywords only — only include itself
+      mentionedBotIds = botId ? [botId] : [];
     }
-
-    // Note: The orchestrator will check its registry to find which bots are registered
-    // We only send bots that are @mentioned or triggered by keywords
-    // The orchestrator handles coordination with registered bots only
 
     // Extract trigger keywords that matched for this bot
     const triggerKeywords = extractTriggerKeywords(message.content);
 
     // Extract modal content (images, videos, text files) from the message
     const imageUrls: string[] = [];
-    const videoUrls: { url: string; mimeType?: string }[] = [];
-    const textAttachments: { name: string; content: string }[] = [];
+    const videoUrls: MediaAttachment[] = [];
+    const textAttachments: TextAttachment[] = [];
 
     if (message.attachments.size > 0) {
       for (const attachment of message.attachments.values()) {
@@ -1230,6 +1678,16 @@ export class DiscordBot {
       }
     }
 
+    // Merge stickers on the triggering message into the media arrays and content.
+    const stickerMedia = extractStickerMedia(message, 'Orchestrator');
+    imageUrls.push(...stickerMedia.imageUrls);
+    videoUrls.push(...stickerMedia.videoUrls);
+    const notifyContent = stickerMedia.stickerHints.length > 0
+      ? (message.content
+          ? `${message.content} ${stickerMedia.stickerHints.join(' ')}`
+          : stickerMedia.stickerHints.join(' '))
+      : message.content;
+
     // Add embedded content from reply context
     if (replyContext?.embeddedContent) {
       imageUrls.push(...replyContext.embeddedContent.images);
@@ -1253,10 +1711,14 @@ export class DiscordBot {
       guildId: message.guildId || 'dm',
       authorId: message.author.id,
       authorName: message.author.username,
-      content: message.content,
+      content: notifyContent,
       mentionedBotIds,
       timestamp: message.createdAt,
       triggerKeywords: triggerKeywords.length > 0 ? triggerKeywords : undefined,
+      replyContext,
+      imageUrls,
+      videoUrls,
+      textAttachments,
     });
 
     console.log(`🎭 [Orchestrator] Mention notification sent, returning immediately`);

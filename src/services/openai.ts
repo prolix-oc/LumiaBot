@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
-import { config, isGemini3Model, isDeepSeekModel, isMoonshotThinkingModel, isGeminiFlashModel, isGeminiProModel } from '../utils/config';
+import { config, isGemini3Model, isDeepSeekModel, isMoonshotThinkingModel, isGeminiFlashModel, isGeminiProModel, isMoonshotProvider } from '../utils/config';
+import { estimateTokenCount, checkBalance } from './moonshot';
 import { searxngService } from './searxng';
 import { userMemoryService, PRONOUN_FALLBACK } from './user-memory';
 import { conversationHistoryService } from './conversation-history';
@@ -7,6 +8,7 @@ import { guildMemoryService } from './guild-memory';
 import { boredomService } from './boredom';
 import { videoService } from './video';
 import { knowledgeGraphService } from './knowledge-graph';
+import type { KnowledgeCandidate } from './knowledge-graph';
 import { musicService, type MusicTrackWithDetails } from './music';
 import { userActivityService, type MusicActivity } from './user-activity';
 import { getBotDefinition } from '../utils/bot-definition';
@@ -16,8 +18,25 @@ import {
   getMusicTasteTemplate,
   getReplyContextTemplate,
   getMemorySystemTemplate,
-  getPersonaReinforcement
+  getPersonaReinforcement,
+  getBotFamilyCooperationPrompt
 } from './prompts';
+
+// Moonshot pricing (per million tokens)
+const COST_INPUT_PER_M  = 0.90;  // cache miss / regular input
+const COST_CACHED_PER_M = 0.10;  // cache hit
+const COST_OUTPUT_PER_M = 4.00;  // output
+
+function logUsageCost(usage: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } | null | undefined): void {
+  if (!usage) return;
+  const cached   = usage.prompt_tokens_details?.cached_tokens ?? 0;
+  const uncached = (usage.prompt_tokens ?? 0) - cached;
+  const output   = usage.completion_tokens ?? 0;
+  const cost = (uncached * COST_INPUT_PER_M + cached * COST_CACHED_PER_M + output * COST_OUTPUT_PER_M) / 1_000_000;
+  console.log(
+    `💰 [AI] Usage — input: ${uncached} (cached: ${cached}) | output: ${output} | est. cost: $${cost.toFixed(6)}`
+  );
+}
 
 /**
  * Music-related keywords for smart detection
@@ -70,7 +89,6 @@ export interface ChatCompletionOptions {
   messages: ChatMessage[];
   enableSearch?: boolean;
   enableKnowledgeGraph?: boolean;
-  knowledgeQuery?: string; // Query for knowledge graph (if not provided, uses message content)
   stream?: boolean;
   temperature?: number;
   maxTokens?: number;
@@ -78,6 +96,8 @@ export interface ChatCompletionOptions {
   videos?: { url: string; mimeType?: string }[]; // URLs of videos to include (Gemini 3 only)
   textAttachments?: { name: string; content: string }[]; // Text file attachments
   pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
+  knowledgeCandidates?: KnowledgeCandidate[];
+  collectiveKnowledgeContext?: string;
   userId?: string; // Discord user ID for memory
   username?: string; // Discord username for memory
   guildId?: string; // Discord guild ID for guild-specific context
@@ -89,13 +109,40 @@ export interface ChatCompletionOptions {
     originalAuthor?: string;
   };
   boredomAction?: 'opted-in' | 'opted-out'; // If user just changed their boredom settings
+  orchestratorContextNote?: string;
   enableMusicTaste?: boolean; // DEPRECATED: Auto-inject music context (default: false). Use get_music_taste tool instead
   conversationSummary?: string; // Per-user past interaction summary for system prompt
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
   // Orchestrator follow-up support
   orchestratorEventId?: string;
-  requestFollowUp?: (eventId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
+  orchestratorTurnId?: string;
+  requestFollowUp?: (eventId: string, turnId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
+  requestCollectiveKnowledge?: (query: string, maxResults?: number) => Promise<string>;
+}
+
+export interface ToolExecutionSnapshot {
+  timestamp: string;
+  model: string;
+  provider: 'moonshot' | 'other';
+  thinkingEnabled: boolean;
+  moonshotThinkingModel: boolean;
+  runToolsUsed: boolean;
+  toolsOffered: number;
+  toolNames: string[];
+  toolRounds: number;
+  toolCalls: number;
+  toolResults: number;
+  attempts: number;
+  status: 'success' | 'error';
+  reason?: string;
+  error?: string;
+}
+
+let lastToolExecutionSnapshot: ToolExecutionSnapshot | null = null;
+
+export function getLastToolExecutionSnapshot(): ToolExecutionSnapshot | null {
+  return lastToolExecutionSnapshot;
 }
 
 export class OpenAIService {
@@ -169,10 +216,14 @@ export class OpenAIService {
       return;
     }
 
-    // Moonshot / Kimi thinking models — force temperature 1.0
+    // Moonshot / Kimi thinking models — Moonshot fixes temperature at 1.0 when
+    // thinking is enabled and 0.6 when it's disabled. Gate on the thinking.type
+    // from OPENAI_RAW_BODY_PARAMS so non-thinking mode isn't forced to 1.0.
     if (isMoonshotThinkingModel()) {
-      params.temperature = 1.0;
-      console.log(`🧠 [AI] Moonshot thinking model detected, temperature set to 1.0`);
+      const thinking = this.rawBodyParams?.thinking as { type?: string } | undefined;
+      const thinkingDisabled = thinking?.type === 'disabled';
+      params.temperature = thinkingDisabled ? 0.6 : 1.0;
+      console.log(`🧠 [AI] Moonshot thinking model detected, temperature set to ${params.temperature} (thinking ${thinkingDisabled ? 'disabled' : 'enabled'})`);
       return;
     }
   }
@@ -287,7 +338,7 @@ export class OpenAIService {
     filtered = filtered.replace(/<\/tool_code>/gi, '');
 
     // Remove standalone tool function calls like store_user_opinion(...)
-    filtered = filtered.replace(/\b(store_user_opinion|get_user_opinion|list_users_with_opinions|web_search)\s*\([^)]*\)/gi, '');
+    filtered = filtered.replace(/\b(store_user_opinion|get_user_opinion|list_users_with_opinions|web_search|get_knowledge_document|get_music_taste|search_music_library|get_user_current_listening)\s*\([^)]*\)/gi, '');
 
     // Remove action/action_input format (common in LangChain-style tool calls)
     // Matches: {"action": "...", "action_input": "..."} or variations
@@ -324,6 +375,42 @@ export class OpenAIService {
   }
 
   /**
+   * Detect hallucinated API response objects that the model outputs as text.
+   * Some models (especially via proxy/router) occasionally emit raw API response
+   * structures instead of actual conversational content.
+   */
+  private isHallucinatedResponse(content: string): boolean {
+    const trimmed = content.trim();
+
+    // Detect provider/router wrappers like "(Empty response: { ... })"
+    if (/^\(Empty response\b[\s\S]*\)$/i.test(trimmed)) {
+      return true;
+    }
+
+    // Detect raw response objects that include an empty content array
+    if (/['"]?content['"]?\s*:\s*\[\s*\]/.test(trimmed) && /[{}()\[\]]/.test(trimmed)) {
+      return true;
+    }
+
+    // Detect raw API response objects containing typical completion fields
+    // Must match at least 2 of these API-specific keys to avoid false positives
+    const apiResponseIndicators = [
+      /['"]?stop_reason['"]?\s*:/,
+      /['"]?input_tokens['"]?\s*:/,
+      /['"]?output_tokens['"]?\s*:/,
+      /['"]?finish_reason['"]?\s*:/,
+      /['"]?type['"]?\s*:\s*['"]thinking['"]/,
+      /['"]?signature['"]?\s*:\s*['"]/,
+    ];
+    const matchCount = apiResponseIndicators.filter(re => re.test(trimmed)).length;
+    if (matchCount >= 2) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
    * Generate completion with retry logic for empty responses
    */
   private async generateWithRetry(
@@ -348,6 +435,9 @@ export class OpenAIService {
           max_tokens: maxTokens,
         };
 
+        // Request usage data for cost estimation
+        requestParams.stream_options = { include_usage: true };
+
         // Add top_k if set (only supported by some OpenAI-compatible APIs)
         if (this.defaultTopK > 0) {
           requestParams.top_k = this.defaultTopK;
@@ -367,19 +457,21 @@ export class OpenAIService {
         }
 
         const completion = await this.client.chat.completions.create(requestParams);
+        logUsageCost((completion as any).usage);
 
         let content = completion.choices[0]?.message?.content || '';
         content = this.filterReasoningContent(content);
         content = this.filterToolCode(content);
 
-        // Check if response is empty
-        if (this.isEmptyResponse(content)) {
-          console.warn(`⚠️ [AI] Empty response on attempt ${attempt}, retrying...`);
+        // Check if response is empty or a hallucinated API response
+        if (this.isEmptyResponse(content) || this.isHallucinatedResponse(content)) {
+          const reason = this.isEmptyResponse(content) ? 'empty' : 'hallucinated API response';
+          console.warn(`⚠️ [AI] Bad response (${reason}) on attempt ${attempt}, retrying...`);
           lastError = new Error('Empty response from LLM');
-          
+
           // Slightly increase temperature for retry to encourage variety
           temperature = Math.min(temperature + 0.1, 1.0);
-          
+
           // Exponential backoff: 1.5s, 3s, 6s
           const backoffMs = 1500 * Math.pow(2, attempt - 1);
           console.log(`⏱️ [AI] Backing off for ${backoffMs}ms before retry...`);
@@ -533,7 +625,9 @@ export class OpenAIService {
     hasVideos?: boolean,
     replyContext?: { isReply: boolean; isReplyToLumia?: boolean; originalContent?: string; originalTimestamp?: string; originalAuthor?: string },
     knowledgeContext?: string,
+    collectiveKnowledgeContext?: string,
     boredomAction?: 'opted-in' | 'opted-out',
+    orchestratorContextNote?: string,
     enableMusicTaste?: boolean,
     lastMessageContent?: string,
     conversationSummary?: string,
@@ -542,52 +636,28 @@ export class OpenAIService {
     pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]
   ): string {
     const botDefinition = getBotDefinition();
-    
-    // Add current date/time context at the very beginning
-    const now = new Date();
-    const currentDateTime = now.toLocaleDateString('en-US', { 
-      weekday: 'long', 
-      year: 'numeric', 
-      month: 'long', 
-      day: 'numeric' 
-    }) + ' at ' + now.toLocaleTimeString('en-US', { 
-      hour: '2-digit', 
-      minute: '2-digit',
-      timeZoneName: 'short'
-    });
-    
-    let systemPrompt = `<datetime>
-Today is ${currentDateTime}.
-</datetime>
 
-<identity>
+    // ── STABLE (never / rarely changes — best cache hit rate) ──────────────
+
+    let systemPrompt = `<identity>
 ${botDefinition}
 </identity>`;
-    
-    // PRIORITY 1: Add explicit current user identification
-    // This MUST be prominent so the bot always knows who it's talking to
-    if (username) {
-      const pronouns = userId ? userMemoryService.getPronouns(userId) : null;
-      const pronounsAttr = pronouns ? ` pronouns="${pronouns}"` : '';
-      systemPrompt += `\n\n<current-user name="${username}"${userId ? ` id="${userId}"` : ''}${pronounsAttr}>
-The current message author. Address THEM — not users from conversation history.
-If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
-      // Add explicitly mentioned users section if present
-      if (mentionedUsers && mentionedUsers.size > 0) {
-        systemPrompt += `\n\n<mentioned-users>`;
-        mentionedUsers.forEach((name, id) => {
-          if (id !== userId) { // Don't list the author as a mention
-            systemPrompt += `\n- ${name} (ID: ${id})`;
-          }
-        });
-        systemPrompt += `\n</mentioned-users>`;
-      }
-
-      systemPrompt += '\n</current-user>\n';
+    // Persona reinforcement — static anchor, keep near top for cache stability
+    const reinforcement = getPersonaReinforcement();
+    if (reinforcement) {
+      systemPrompt += '\n\n' + reinforcement;
     }
-    
-    // PRIORITY 2: Add video-specific instructions if videos are present
+
+    const botFamilyCooperation = getBotFamilyCooperationPrompt();
+    if (botFamilyCooperation) {
+      systemPrompt += '\n\n' + botFamilyCooperation;
+    }
+
+    // Static channel context note
+    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The final turn is the active message you are responding to; in orchestrator mode it may be from another bot rather than from a human. If a <current-user> block is present, that identifies the active human speaker for this exchange. If you see transcript blocks like <orchestrator-bot-message> or <orchestrator-user-message>, treat them as quoted messages from distinct participants. Bot-tagged transcript blocks are not your persona unless they appear as assistant-role turns.\n</message-context-note>`;
+
+    // Video instructions — static text, just conditionally included
     if (hasVideos) {
       const videoInstructions = getVideoReactionInstructions();
       if (videoInstructions) {
@@ -595,38 +665,9 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
-    // PRIORITY 3: Per-user past interaction summary (background context)
-    if (conversationSummary) {
-      systemPrompt += '\n\n' + conversationSummary;
-    }
+    // ── SLOW-CHANGING (guild/user-scoped, infrequent updates) ──────────────
 
-    // PRIORITY 3b: Message context note — explain that the turns are the live channel
-    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The current user's latest message is the final turn.\n</message-context-note>`;
-
-    // PRIORITY 5: Add reply-specific context (HIGHEST PRIORITY for this specific turn)
-    if (replyContext?.isReply && replyContext.originalContent) {
-      systemPrompt += this.buildReplyContextPrompt(replyContext);
-    }
-
-    // Add text file attachments if present
-    if (textAttachments && textAttachments.length > 0) {
-      systemPrompt += `\n\n<attached-files>`;
-      for (const attachment of textAttachments) {
-        systemPrompt += `\n<file name="${attachment.name}">\n${attachment.content}\n</file>`;
-      }
-      systemPrompt += `\n</attached-files>`;
-    }
-
-    // Add extracted web page contents if present
-    if (pageContents && pageContents.length > 0) {
-      systemPrompt += `\n\n<web-pages>`;
-      for (const page of pageContents) {
-        systemPrompt += `\n<page title="${page.title}" url="${page.url}">\n${page.content}\n</page>`;
-      }
-      systemPrompt += `\n</web-pages>`;
-    }
-
-    // Add guild-specific context if available
+    // Guild inside jokes — changes rarely, scoped per guild
     if (guildId) {
       const insideJokesContext = guildMemoryService.getInsideJokesContext(guildId);
       if (insideJokesContext) {
@@ -634,20 +675,28 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
-    // Add knowledge graph context if available
-    if (knowledgeContext) {
-      systemPrompt += `\n\n${knowledgeContext}`;
+    // Music context — changes rarely
+    if (enableMusicTaste === true && lastMessageContent && isMusicQuestion(lastMessageContent)) {
+      console.log(`🎵 [MUSIC] Music context injection explicitly enabled for music query`);
+      const musicContext = this.buildMusicContext();
+      if (musicContext) {
+        systemPrompt += `\n\n<music-context>\n${musicContext}\n</music-context>`;
+      }
     }
-    
-    // PRIORITY 6: Add stored memory/opinion context (LOWER PRIORITY than recent conversation)
-    // This prevents old memories from overriding current conversation flow
+
+    // Per-user past interaction summary — changes slowly
+    if (conversationSummary) {
+      systemPrompt += '\n\n' + conversationSummary;
+    }
+
+    // Per-user stored memory/opinions — changes slowly
     if (userId) {
       // Sync stored username with current Discord username to prevent stale names in context
       if (username) {
         userMemoryService.syncUsername(userId, username);
       }
       const memoryContext = userMemoryService.getOpinionContext(userId);
-      
+
       if (memoryContext) {
         systemPrompt += `\n\n${memoryContext}`;
       } else {
@@ -660,27 +709,71 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
-    // Add boredom action context if user just opted in/out
+    // Knowledge graph result — per-query, but deterministic for a given query
+    if (knowledgeContext) {
+      systemPrompt += `\n\n${knowledgeContext}`;
+    }
+
+    if (collectiveKnowledgeContext) {
+      systemPrompt += `\n\n${collectiveKnowledgeContext}`;
+    }
+
+    // ── VOLATILE (per-message — cache will miss here regardless) ───────────
+
+    // Current user identification
+    if (username) {
+      const pronouns = userId ? userMemoryService.getPronouns(userId) : null;
+      const pronounsAttr = pronouns ? ` pronouns="${pronouns}"` : '';
+      systemPrompt += `\n\n<current-user name="${username}"${userId ? ` id="${userId}"` : ''}${pronounsAttr}>
+The current message author. Address THEM — not users from conversation history.
+If they mention @OtherUser, they are talking TO that user, not AS them.`;
+
+      if (mentionedUsers && mentionedUsers.size > 0) {
+        systemPrompt += `\n\n<mentioned-users>`;
+        mentionedUsers.forEach((name, id) => {
+          if (id !== userId) {
+            systemPrompt += `\n- ${name} (ID: ${id})`;
+          }
+        });
+        systemPrompt += `\n</mentioned-users>`;
+      }
+
+      systemPrompt += '\n</current-user>\n';
+    }
+
+    // Reply-specific context
+    if (replyContext?.isReply && replyContext.originalContent) {
+      systemPrompt += this.buildReplyContextPrompt(replyContext);
+    }
+
+    if (orchestratorContextNote) {
+      systemPrompt += `\n\n<orchestrator-session>\n${orchestratorContextNote}\n</orchestrator-session>`;
+    }
+
+    // Text file attachments
+    if (textAttachments && textAttachments.length > 0) {
+      systemPrompt += `\n\n<attached-files>`;
+      for (const attachment of textAttachments) {
+        systemPrompt += `\n<file name="${attachment.name}">\n${attachment.content}\n</file>`;
+      }
+      systemPrompt += `\n</attached-files>`;
+    }
+
+    // Extracted web page contents
+    if (pageContents && pageContents.length > 0) {
+      systemPrompt += `\n\n<web-pages>`;
+      for (const page of pageContents) {
+        systemPrompt += `\n<page title="${page.title}" url="${page.url}">\n${page.content}\n</page>`;
+      }
+      systemPrompt += `\n</web-pages>`;
+    }
+
+    // Boredom opt-in/out acknowledgement
     if (boredomAction) {
       const boredomInstructions = getBoredomUpdateInstructions(boredomAction);
       if (boredomInstructions) {
         systemPrompt += `\n\n<boredom-update>\n${boredomInstructions}\n</boredom-update>`;
       }
-    }
-
-    // Music context auto-injection is DISABLED by default
-    if (enableMusicTaste === true && lastMessageContent && isMusicQuestion(lastMessageContent)) {
-      console.log(`🎵 [MUSIC] Music context injection explicitly enabled for music query`);
-      const musicContext = this.buildMusicContext();
-      if (musicContext) {
-        systemPrompt += `\n\n<music-context>\n${musicContext}\n</music-context>`;
-      }
-    }
-
-    // Persona reinforcement — end-of-prompt anchor to counteract history drift
-    const reinforcement = getPersonaReinforcement();
-    if (reinforcement) {
-      systemPrompt += '\n\n' + reinforcement;
     }
 
     return systemPrompt;
@@ -776,7 +869,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
   }
 
   async createChatCompletion(options: ChatCompletionOptions): Promise<string> {
-    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
+    const { messages, enableSearch, enableKnowledgeGraph, temperature, maxTokens, images, videos, textAttachments, pageContents, knowledgeCandidates, collectiveKnowledgeContext, userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -795,21 +888,14 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
-    // Query knowledge graph if enabled
-    let knowledgeContext: string | undefined;
-    if (enableKnowledgeGraph) {
-      // Use knowledgeQuery if provided, otherwise extract from last user message
-      const query = knowledgeQuery || messages[messages.length - 1]?.content?.toString() || '';
-      if (query) {
-        knowledgeContext = await knowledgeGraphService.queryKnowledgeBase(query, 3);
-      }
-    }
-
     // Get last message content for music detection
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
+    const knowledgeCandidateContext = knowledgeCandidates && knowledgeCandidates.length > 0
+      ? knowledgeGraphService.formatCandidateContext(knowledgeCandidates)
+      : undefined;
 
     // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeCandidateContext, collectiveKnowledgeContext, boredomAction, orchestratorContextNote, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
 
     // Convert image URLs to base64 data URIs so external APIs can access them
     let processedImages = images;
@@ -825,10 +911,16 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       console.log(`🎥 [VIDEO] Successfully processed ${processedVideos.length}/${videos!.length} videos`);
     }
 
-    // Pre-response persona directive — prepended to last user message so it's
-    // the final text the model reads before generating. Stays in the user role
-    // so it's provider-safe (no mid-conversation system messages).
-    const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';
+    // Build the per-turn user message prefix: datetime reminder + persona directive.
+    // Injected into the last user message (not the system prompt) so the stable
+    // system prompt prefix stays cacheable across turns.
+    const now = new Date();
+    const currentDateTime = now.toLocaleDateString('en-US', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+    }) + ' at ' + now.toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
+    });
+    const USER_MESSAGE_PREFIX = `<system-reminder>\nToday is ${currentDateTime}.\n</system-reminder>\n\n[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]\n\n`;
 
     // Build message array with enhanced system prompt
     const enhancedMessages: OpenAI.ChatCompletionMessageParam[] = [
@@ -847,11 +939,11 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
             content = this.buildMultimodalContent(m.content, processedImages);
           }
 
-          // Prepend persona directive to the first text part
+          // Prepend datetime reminder + persona directive to the first text part
           const firstTextIdx = content.findIndex(p => p.type === 'text');
           if (firstTextIdx !== -1) {
             const textPart = content[firstTextIdx] as OpenAI.ChatCompletionContentPartText;
-            content[firstTextIdx] = { type: 'text', text: PERSONA_DIRECTIVE + '\n\n' + textPart.text };
+            content[firstTextIdx] = { type: 'text', text: USER_MESSAGE_PREFIX + textPart.text };
           }
 
           console.log(`🖼️  [MULTIMODAL] Built message with ${content.length} content parts`);
@@ -861,11 +953,11 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           } as OpenAI.ChatCompletionMessageParam;
         }
 
-        // Last user message (text only) — prepend persona directive
+        // Last user message (text only) — prepend datetime reminder + persona directive
         if (isLastUserMessage && typeof m.content === 'string') {
           return {
             role: m.role,
-            content: PERSONA_DIRECTIVE + '\n\n' + m.content,
+            content: USER_MESSAGE_PREFIX + m.content,
           } as OpenAI.ChatCompletionMessageParam;
         }
 
@@ -887,14 +979,40 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
     // Clean up uploaded videos after use (in finally block later)
 
+    const provider: 'moonshot' | 'other' = isMoonshotProvider() ? 'moonshot' : 'other';
+    const moonshotThinkingModel = isMoonshotThinkingModel();
+    const hasKnowledgeCandidates = !!(options.knowledgeCandidates && options.knowledgeCandidates.length > 0);
+
     // Determine if we need tools at all
-    // Memory/interaction tools are always available when user context exists
-    // Search/knowledge tools are gated on their respective flags
+    // Search is attached by default unless explicitly disabled.
+    // Knowledge is attached when documents exist unless explicitly disabled.
     const hasUserContext = !!(userId && username);
-    const needsTools = enableSearch || enableKnowledgeGraph || hasUserContext || !!options.getUserListeningActivity || !!options.orchestratorEventId;
+    const needsTools = enableSearch !== false || hasKnowledgeCandidates || hasUserContext || musicService.hasTracks() || !!options.getUserListeningActivity || !!options.orchestratorEventId || !!options.requestCollectiveKnowledge;
 
     if (!needsTools) {
       console.log(`\n🌐 [AI] No tools needed (no user context or search) - normal completion`);
+
+      lastToolExecutionSnapshot = {
+        timestamp: new Date().toISOString(),
+        model: this.model,
+        provider,
+        thinkingEnabled: config.thinking.enabled,
+        moonshotThinkingModel,
+        runToolsUsed: false,
+        toolsOffered: 0,
+        toolNames: [],
+        toolRounds: 0,
+        toolCalls: 0,
+        toolResults: 0,
+        attempts: 0,
+        status: 'success',
+        reason: 'No tools were needed for this request',
+      };
+
+      // Moonshot: estimate tokens before request
+      if (isMoonshotProvider()) {
+        await estimateTokenCount(this.model, enhancedMessages as any).catch(() => {});
+      }
 
       try {
         const content = await this.generateWithRetry(
@@ -902,6 +1020,11 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           temperature ?? this.defaultTemperature,
           maxTokens ?? this.defaultMaxTokens
         );
+
+        // Moonshot: check balance after response (fire-and-forget)
+        if (isMoonshotProvider()) {
+          checkBalance().catch(() => {});
+        }
 
         return content;
       } catch (error) {
@@ -912,7 +1035,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     // Tools needed - use runTools helper for automatic function calling
-    console.log(`\n🔧 [AI] Tools enabled - using runTools helper (search: ${enableSearch}, knowledge: ${enableKnowledgeGraph}, user context: ${hasUserContext})`);
+    console.log(`\n🔧 [AI] Tools enabled - using runTools helper (search: ${enableSearch !== false}, knowledge: ${enableKnowledgeGraph !== false}, user context: ${hasUserContext})`);
     
     try {
       console.log(`🌐 [AI] Step 1: AI will decide which tools to use...`);
@@ -986,24 +1109,23 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         }
       };
 
-      // Define knowledge graph function
-      const queryKnowledgeBaseFunction = async (args: { query: string; maxResults?: number }) => {
-        console.log(`📚 [AI KNOWLEDGE] Querying knowledge base: "${args.query}"`);
-        
+      const getKnowledgeDocumentFunction = async (args: { docId: number }) => {
+        console.log(`📚 [AI KNOWLEDGE] Fetching knowledge document ${args.docId}`);
+
         try {
-          const context = await knowledgeGraphService.queryKnowledgeBase(
-            args.query, 
-            args.maxResults || 3
-          );
-          
-          if (context) {
-            return `Retrieved knowledge base context:\n\n${context}`;
-          } else {
-            return 'No relevant documents found in the knowledge base for this query.';
+          const allowedCandidates = options.knowledgeCandidates || [];
+          const isAllowed = allowedCandidates.some((candidate) => candidate.id === args.docId);
+          if (!isAllowed) {
+            const allowedList = allowedCandidates.length > 0
+              ? allowedCandidates.map((candidate) => `${candidate.id}:${candidate.title}`).join(', ')
+              : 'none';
+            return `Error: Doc ID ${args.docId} is not in the current deterministic candidate list. Allowed candidates: ${allowedList}.`;
           }
+
+          return knowledgeGraphService.getDocumentToolPayload(args.docId);
         } catch (error) {
-          console.error('📚 [AI KNOWLEDGE] Failed to query knowledge base:', error);
-          return 'Error: Failed to query knowledge base.';
+          console.error('📚 [AI KNOWLEDGE] Failed to fetch knowledge document:', error);
+          return 'Error: Failed to fetch the requested knowledge document.';
         }
       };
 
@@ -1058,6 +1180,33 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         } catch (error) {
           console.error('🎵 [AI MUSIC] Failed to get music taste:', error);
           return 'Error: Failed to retrieve music taste.';
+        }
+      };
+
+      const searchMusicLibraryFunction = async (args: { query: string; maxResults?: number }) => {
+        console.log(`🎵 [AI MUSIC] Searching music library for "${args.query}"`);
+
+        try {
+          const results = musicService.searchLibrary(args.query, args.maxResults || 5);
+          if (results.length === 0) {
+            return `No tracks or artists found in your Spotify library for "${args.query}".`;
+          }
+
+          let response = `Matches in your Spotify library for "${args.query}":\n`;
+          results.forEach((track, index) => {
+            const genres = track.genres.slice(0, 3).join(', ');
+            response += `\n${index + 1}. "${track.name}" by ${track.artists.map(a => a.name).join(', ')}`;
+            response += `\n   Album: ${track.album.name}`;
+            if (genres) {
+              response += `\n   Genres: ${genres}`;
+            }
+            response += `\n   Spotify: ${track.spotifyUrl}`;
+          });
+
+          return response;
+        } catch (error) {
+          console.error('🎵 [AI MUSIC] Failed to search music library:', error);
+          return 'Error: Failed to search the music library.';
         }
       };
 
@@ -1273,20 +1422,26 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       };
 
       // Build tools array
-      // Search/knowledge tools are gated on their flags; memory/interaction tools are always available with user context
       const now = new Date();
       const currentDate = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+      const knowledgeCandidates = options.knowledgeCandidates || [];
+      const knowledgeToolEnabled = enableKnowledgeGraph !== false && knowledgeCandidates.length > 0;
+      const knowledgeSummary = knowledgeToolEnabled
+        ? knowledgeGraphService.formatCandidateSummary(knowledgeCandidates)
+        : '';
+      const musicToolEnabled = musicService.hasTracks();
+      const musicSummary = musicToolEnabled ? musicService.getToolSummary(4) : '';
 
       const tools: any[] = [];
 
-      // Web search tool - only when search intent detected
-      if (enableSearch) {
+      // Web search tool - attach by default and let the model decide based on user intent
+      if (enableSearch !== false) {
         tools.push({
           type: 'function',
           function: {
             function: webSearchFunction,
             parse: JSON.parse,
-            description: `Search the web for current information, news, facts, or any query that requires up-to-date or external information. Today is ${currentDate}. Use this when you need information you don't already know or when the user asks about current events, recent developments, or specific facts.`,
+            description: `Search the web for current information, source verification, news, facts, or anything that should be confirmed against live internet results. Today is ${currentDate}. Use this when the user asks you to confirm something from the web, wants a source-backed answer, or asks about recent or fast-changing information.`,
             name: 'web_search',
             parameters: {
               type: 'object',
@@ -1302,25 +1457,61 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         });
       }
 
-      // Knowledge graph tool - only when knowledge intent detected
-      if (enableKnowledgeGraph) {
+      // Knowledge document tool - raw fetch only from deterministic candidates
+      if (knowledgeToolEnabled) {
         tools.push({
           type: 'function',
           function: {
-            function: queryKnowledgeBaseFunction,
+            function: getKnowledgeDocumentFunction,
             parse: JSON.parse,
-            description: 'Query your internal knowledge base for domain-specific information, documentation, or resources. Use this when the user asks about specific topics like "Loom", "Lucid Loom", technical concepts, or any subject you have stored documents about. This retrieves curated knowledge that you should present naturally in your chaotic voice.',
-            name: 'query_knowledge_base',
+            description: `Fetch the full raw content of one of the deterministic knowledge candidates already matched for this message. Only use doc IDs from this list: ${knowledgeSummary}`,
+            name: 'get_knowledge_document',
+            parameters: {
+              type: 'object',
+              properties: {
+                docId: {
+                  type: 'number',
+                  description: 'The document ID from the deterministic knowledge candidate list in the prompt.',
+                },
+              },
+              required: ['docId'],
+            },
+          },
+        });
+      }
+
+      if (musicToolEnabled) {
+        tools.push({
+          type: 'function',
+          function: {
+            function: getMusicTasteFunction,
+            parse: JSON.parse,
+            description: `Get your music taste overview from imported Spotify playlists. Use this for questions about what you listen to, your taste, or broad music recommendations. ${musicSummary}`,
+            name: 'get_music_taste',
+            parameters: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        });
+
+        tools.push({
+          type: 'function',
+          function: {
+            function: searchMusicLibraryFunction,
+            parse: JSON.parse,
+            description: `Search your imported Spotify library for specific tracks, artists, or genres. Use this when the user mentions a specific song, artist, vibe, or genre and you want grounded music context instead of guessing. ${musicSummary}`,
+            name: 'search_music_library',
             parameters: {
               type: 'object',
               properties: {
                 query: {
                   type: 'string',
-                  description: 'The search query to find relevant knowledge documents. Should include key terms and topics.',
+                  description: 'The track, artist, or genre to look for in the imported Spotify library.',
                 },
                 maxResults: {
                   type: 'number',
-                  description: 'Maximum number of documents to retrieve (1-5). Default is 3.',
+                  description: 'Maximum number of matches to return (default: 5).',
                 },
               },
               required: ['query'],
@@ -1328,21 +1519,6 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           },
         });
       }
-
-      // Music taste tool - always available
-      tools.push({
-        type: 'function',
-        function: {
-          function: getMusicTasteFunction,
-          parse: JSON.parse,
-          description: 'Get your music taste information - what songs, artists, and genres you know. Use this when someone asks about your music taste, what you listen to, your favorite songs, or wants music recommendations. Returns real tracks from your imported Spotify playlists.',
-          name: 'get_music_taste',
-          parameters: {
-            type: 'object',
-            properties: {},
-          },
-        },
-      });
 
       // Add user current listening tool if callback is provided
       if (options.getUserListeningActivity) {
@@ -1609,14 +1785,15 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       }
 
       // Orchestrator follow-up tool - only available during orchestrated conversations
-      if (options.orchestratorEventId && options.requestFollowUp) {
+      if (options.orchestratorEventId && options.orchestratorTurnId && options.requestFollowUp) {
         const requestFollowUpFn = options.requestFollowUp;
         const eventId = options.orchestratorEventId;
+        const turnId = options.orchestratorTurnId;
         tools.push({
           type: 'function',
           function: {
             function: async (args: { reason: string }) => {
-              const result = await requestFollowUpFn(eventId, undefined, args.reason);
+              const result = await requestFollowUpFn(eventId, turnId, undefined, args.reason);
               console.log(`🔧 [AI] Follow-up request result: ${result.approved ? 'approved' : 'denied'} (${result.reason})`);
               if (result.approved) {
                 return 'Follow-up request approved! You will get another turn after the other bot(s) respond. Continue with your current response for now.';
@@ -1641,6 +1818,52 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
         });
       }
 
+      if (options.requestCollectiveKnowledge) {
+        const requestCollectiveKnowledgeFn = options.requestCollectiveKnowledge;
+        tools.push({
+          type: 'function',
+          function: {
+            function: async (args: { query: string; maxResults?: number }) => {
+              const result = await requestCollectiveKnowledgeFn(args.query, args.maxResults);
+              console.log('📚 [AI] Collective knowledge query completed');
+              return result;
+            },
+            parse: JSON.parse,
+            description: 'Search the orchestrator knowledge graph and the other connected bots\' local knowledge graphs. Use this when local knowledge is missing, when shared orchestrator-backed knowledge is preferred, or when you want a second source of truth from the wider bot network. If another cooperating bot surfaces a new claim, entity, mechanism, or angle that may depend on missing evidence, use this again before answering.',
+            name: 'query_collective_knowledge',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description: 'A focused search query describing the missing fact, topic, or concept you want the other connected bots to look up in their local knowledge graphs.',
+                },
+                maxResults: {
+                  type: 'number',
+                  description: 'Maximum combined results to return from the other connected bots (default: 5).',
+                },
+              },
+              required: ['query'],
+            },
+          },
+        });
+      }
+
+      // Moonshot: estimate tokens before request (include tool schemas for accuracy)
+      if (isMoonshotProvider()) {
+        await estimateTokenCount(this.model, enhancedMessages as any, tools).catch(() => {});
+      }
+
+      const toolNames = tools
+        .map((tool: any) => tool?.function?.name)
+        .filter((name: unknown): name is string => typeof name === 'string' && name.length > 0);
+      console.log(`🧰 [AI] Offered ${toolNames.length} tool(s): ${toolNames.join(', ')}`);
+
+      let totalToolRounds = 0;
+      let totalToolCalls = 0;
+      let totalToolResults = 0;
+      let attemptCount = 0;
+
       // Use runTools with retry logic for empty responses
       const maxRetries = 3;
       let lastError: Error | null = null;
@@ -1648,6 +1871,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+          attemptCount = attempt;
           console.log(`🌐 [AI] Step 2: Waiting for response (attempt ${attempt}/${maxRetries})...`);
 
           // Build runTools parameters
@@ -1659,6 +1883,8 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             temperature: currentTemp,
             top_p: this.defaultTopP,
             max_tokens: maxTokens ?? this.defaultMaxTokens,
+            maxChatCompletions: 10,
+            stream_options: { include_usage: true },
           };
 
           // Add top_k if set (only supported by some OpenAI-compatible APIs)
@@ -1683,16 +1909,35 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           // Note: runTools is available in the beta namespace of the OpenAI SDK
           const runner = this.client.beta.chat.completions.runTools(runToolsParams);
 
+          // Log multi-step tool call progress for observability
+          let toolRound = 0;
+          runner.on('message', (message) => {
+            if (message.role === 'assistant' && message.tool_calls?.length) {
+              toolRound++;
+              totalToolRounds++;
+              totalToolCalls += message.tool_calls.length;
+              const toolNames = message.tool_calls.map((tc: any) => tc.function?.name).filter(Boolean);
+              console.log(`🔄 [AI] Tool round ${toolRound}: calling ${toolNames.join(', ')}`);
+            }
+          });
+          runner.on('functionCallResult', (result) => {
+            totalToolResults++;
+            const preview = typeof result === 'string' ? result.slice(0, 200) : String(result).slice(0, 200);
+            console.log(`📎 [AI] Tool result (round ${toolRound}): ${preview}${preview.length >= 200 ? '...' : ''}`);
+          });
+
           // Get the final response
           const finalCompletion = await runner.finalChatCompletion();
+          logUsageCost((finalCompletion as any).usage);
 
           let content = finalCompletion.choices[0]?.message?.content || '';
           content = this.filterReasoningContent(content);
           content = this.filterToolCode(content);
 
-          // Check if response is empty
-          if (this.isEmptyResponse(content)) {
-            console.warn(`⚠️ [AI] Empty response on attempt ${attempt}, retrying...`);
+          // Check if response is empty or a hallucinated API response
+          if (this.isEmptyResponse(content) || this.isHallucinatedResponse(content)) {
+            const reason = this.isEmptyResponse(content) ? 'empty' : 'hallucinated API response';
+            console.warn(`⚠️ [AI] Bad response (${reason}) on attempt ${attempt}, retrying...`);
             lastError = new Error('Empty response from LLM');
 
             // Slightly increase temperature for retry
@@ -1705,12 +1950,56 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           }
 
           console.log(`✅ [AI] Response generated successfully on attempt ${attempt}`);
+          console.log(`🧾 [AI] Tool execution summary: rounds=${totalToolRounds}, calls=${totalToolCalls}, results=${totalToolResults}`);
+          if (totalToolCalls === 0) {
+            console.warn(`⚠️ [AI] Tools were offered but no tool calls were made by the model`);
+          }
+
+          lastToolExecutionSnapshot = {
+            timestamp: new Date().toISOString(),
+            model: this.model,
+            provider,
+            thinkingEnabled: config.thinking.enabled,
+            moonshotThinkingModel,
+            runToolsUsed: true,
+            toolsOffered: toolNames.length,
+            toolNames,
+            toolRounds: totalToolRounds,
+            toolCalls: totalToolCalls,
+            toolResults: totalToolResults,
+            attempts: attempt,
+            status: 'success',
+            reason: totalToolCalls === 0 ? 'Tools were offered but model did not call any tools' : undefined,
+          };
+
+          // Moonshot: check balance after response (fire-and-forget)
+          if (isMoonshotProvider()) {
+            checkBalance().catch(() => {});
+          }
+
           return content;
 
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
           console.error(`❌ [AI] Error on attempt ${attempt}: ${errorMsg}`);
           lastError = error as Error;
+
+          lastToolExecutionSnapshot = {
+            timestamp: new Date().toISOString(),
+            model: this.model,
+            provider,
+            thinkingEnabled: config.thinking.enabled,
+            moonshotThinkingModel,
+            runToolsUsed: true,
+            toolsOffered: toolNames.length,
+            toolNames,
+            toolRounds: totalToolRounds,
+            toolCalls: totalToolCalls,
+            toolResults: totalToolResults,
+            attempts: attempt,
+            status: 'error',
+            error: errorMsg,
+          };
 
           if (attempt < maxRetries) {
             await new Promise(resolve => setTimeout(resolve, 500 * attempt));
@@ -1720,17 +2009,40 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
       // All retries exhausted
       console.error(`🚫 [AI] All ${maxRetries} attempts failed`);
+      if (lastToolExecutionSnapshot) {
+        lastToolExecutionSnapshot.attempts = Math.max(lastToolExecutionSnapshot.attempts, attemptCount || maxRetries);
+      }
       throw lastError || new Error('Failed to generate response after multiple attempts');
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error(`❌ [AI] Stream generation failed: ${errorMessage}`);
+
+      if (!lastToolExecutionSnapshot || lastToolExecutionSnapshot.status !== 'error') {
+        lastToolExecutionSnapshot = {
+          timestamp: new Date().toISOString(),
+          model: this.model,
+          provider,
+          thinkingEnabled: config.thinking.enabled,
+          moonshotThinkingModel,
+          runToolsUsed: needsTools,
+          toolsOffered: 0,
+          toolNames: [],
+          toolRounds: 0,
+          toolCalls: 0,
+          toolResults: 0,
+          attempts: 0,
+          status: 'error',
+          error: errorMessage,
+        };
+      }
+
       throw new Error('Failed to generate response - please try again');
     }
   }
 
   async *streamChatCompletion(options: ChatCompletionOptions): AsyncGenerator<string> {
-    const { messages, enableSearch = false, enableKnowledgeGraph = false, knowledgeQuery, temperature, maxTokens, images, videos, textAttachments, pageContents, userId, username, guildId, replyContext, boredomAction, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
+    const { messages, temperature, maxTokens, images, videos, textAttachments, pageContents, knowledgeCandidates, collectiveKnowledgeContext, userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -1763,24 +2075,23 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
       console.log(`🎥 [VIDEO STREAM] Successfully processed ${processedVideos.length}/${videos!.length} videos`);
     }
 
-    // Query knowledge graph if enabled
-    let knowledgeContext: string | undefined;
-    if (enableKnowledgeGraph) {
-      // Use knowledgeQuery if provided, otherwise extract from last user message
-      const query = knowledgeQuery || messages[messages.length - 1]?.content?.toString() || '';
-      if (query) {
-        knowledgeContext = await knowledgeGraphService.queryKnowledgeBase(query, 3);
-      }
-    }
-
     // Get last message content for music detection
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
+    const knowledgeCandidateContext = knowledgeCandidates && knowledgeCandidates.length > 0
+      ? knowledgeGraphService.formatCandidateContext(knowledgeCandidates)
+      : undefined;
 
     // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeContext, boredomAction, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeCandidateContext, collectiveKnowledgeContext, boredomAction, orchestratorContextNote, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
 
-    // Pre-response persona directive — prepended to last user message
-    const PERSONA_DIRECTIVE = '[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]';
+    // Build the per-turn user message prefix: datetime reminder + persona directive.
+    const now = new Date();
+    const currentDateTime = now.toLocaleDateString('en-US', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+    }) + ' at ' + now.toLocaleTimeString('en-US', {
+      hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
+    });
+    const USER_MESSAGE_PREFIX = `<system-reminder>\nToday is ${currentDateTime}.\n</system-reminder>\n\n[Stay in character — follow your system instructions and persona rules above, not patterns from conversation history.]\n\n`;
 
     const enhancedMessages: OpenAI.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
@@ -1798,11 +2109,11 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             content = this.buildMultimodalContent(m.content, processedImages);
           }
 
-          // Prepend persona directive to the first text part
+          // Prepend datetime reminder + persona directive to the first text part
           const firstTextIdx = content.findIndex(p => p.type === 'text');
           if (firstTextIdx !== -1) {
             const textPart = content[firstTextIdx] as OpenAI.ChatCompletionContentPartText;
-            content[firstTextIdx] = { type: 'text', text: PERSONA_DIRECTIVE + '\n\n' + textPart.text };
+            content[firstTextIdx] = { type: 'text', text: USER_MESSAGE_PREFIX + textPart.text };
           }
 
           console.log(`🖼️  [MULTIMODAL STREAM] Built message with ${content.length} content parts`);
@@ -1812,11 +2123,11 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           } as OpenAI.ChatCompletionMessageParam;
         }
 
-        // Last user message (text only) — prepend persona directive
+        // Last user message (text only) — prepend datetime reminder + persona directive
         if (isLastUserMessage && typeof m.content === 'string') {
           return {
             role: m.role,
-            content: PERSONA_DIRECTIVE + '\n\n' + m.content,
+            content: USER_MESSAGE_PREFIX + m.content,
           } as OpenAI.ChatCompletionMessageParam;
         }
 

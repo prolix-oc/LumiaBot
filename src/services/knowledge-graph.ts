@@ -1,4 +1,7 @@
 import { Database } from 'bun:sqlite';
+import { importMarkdownDirectory } from '../utils/markdown-parser';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 export interface KnowledgeDocument {
   id?: number;
@@ -26,6 +29,21 @@ export interface KnowledgeSearchResult {
   document: KnowledgeDocument;
   relevanceScore: number;
   matchedKeywords: string[];
+}
+
+export interface KnowledgeCandidate {
+  id: number;
+  title: string;
+  topic: string;
+  type: 'document' | 'link' | 'snippet';
+  url?: string;
+  relevanceScore: number;
+  matchedKeywords: string[];
+  preview: string;
+}
+
+export interface CollectiveKnowledgeCandidate extends KnowledgeCandidate {
+  excerpt: string;
 }
 
 export class KnowledgeGraphService {
@@ -166,6 +184,19 @@ export class KnowledgeGraphService {
   }
 
   /**
+   * Get all documents, ordered by priority
+   */
+  getAllDocuments(limit: number = 50): KnowledgeDocument[] {
+    const results = this.db.query(
+      `SELECT * FROM knowledge_documents
+       ORDER BY priority DESC, topic ASC, title ASC
+       LIMIT ?`
+    ).all(limit) as any[];
+
+    return results.map(r => this.mapRowToDocument(r));
+  }
+
+  /**
    * Get all documents for a topic
    */
   getDocumentsByTopic(topic: string, limit: number = 10): KnowledgeDocument[] {
@@ -294,6 +325,96 @@ export class KnowledgeGraphService {
     return this.formatKnowledgeContext(results);
   }
 
+  findCandidateDocuments(query: string, maxResults: number = 5): KnowledgeCandidate[] {
+    const results = this.searchByKeywords({
+      query,
+      maxResults,
+    });
+
+    return results.map((result) => ({
+      id: result.document.id!,
+      title: result.document.title,
+      topic: result.document.topic,
+      type: result.document.type,
+      url: result.document.url,
+      relevanceScore: result.relevanceScore,
+      matchedKeywords: result.matchedKeywords,
+      preview: this.buildPreview(result.document.content),
+    }));
+  }
+
+  findCollectiveKnowledgeCandidates(query: string, maxResults: number = 3, excerptLength: number = 700): CollectiveKnowledgeCandidate[] {
+    const results = this.searchByKeywords({
+      query,
+      maxResults,
+    });
+
+    return results.map((result) => ({
+      id: result.document.id!,
+      title: result.document.title,
+      topic: result.document.topic,
+      type: result.document.type,
+      url: result.document.url,
+      relevanceScore: result.relevanceScore,
+      matchedKeywords: result.matchedKeywords,
+      preview: this.buildPreview(result.document.content),
+      excerpt: this.buildExcerpt(result.document.content, excerptLength),
+    }));
+  }
+
+  formatCandidateContext(candidates: KnowledgeCandidate[]): string {
+    if (candidates.length === 0) {
+      return '';
+    }
+
+    const sections = candidates.map((candidate, index) => {
+      const matchedKeywords = candidate.matchedKeywords.length > 0
+        ? candidate.matchedKeywords.join(', ')
+        : 'none';
+      const urlLine = candidate.url ? `\nURL: ${candidate.url}` : '';
+      return `${index + 1}. Doc ID ${candidate.id}: ${candidate.title}\nTopic: ${candidate.topic}\nType: ${candidate.type}\nMatched keywords: ${matchedKeywords}${urlLine}\nPreview: ${candidate.preview}`;
+    });
+
+    return `<knowledge-candidates>
+Deterministic candidate documents for this message. These are the closest knowledge matches already found in app code.
+If you need the full raw content from one of them, call get_knowledge_document with its Doc ID.
+
+${sections.join('\n\n')}
+</knowledge-candidates>`;
+  }
+
+  formatCandidateSummary(candidates: KnowledgeCandidate[]): string {
+    if (candidates.length === 0) {
+      return 'No candidate documents were matched for this message.';
+    }
+
+    return candidates
+      .map((candidate) => `Doc ID ${candidate.id}: "${candidate.title}" (${candidate.topic})`)
+      .join('; ');
+  }
+
+  getDocumentToolPayload(id: number): string {
+    const document = this.getDocument(id);
+    if (!document) {
+      return `Knowledge document ${id} was not found.`;
+    }
+
+    this.incrementUsage(id);
+
+    let output = `Knowledge document ${id}: ${document.title}\n`;
+    output += `Topic: ${document.topic}\n`;
+    output += `Type: ${document.type}\n`;
+    if (document.url) {
+      output += `URL: ${document.url}\n`;
+    }
+    if (document.keywords.length > 0) {
+      output += `Keywords: ${document.keywords.join(', ')}\n`;
+    }
+    output += `\n${document.content}`;
+
+    return output;
+  }
+
   /**
    * Increment usage count for a document
    */
@@ -405,6 +526,56 @@ ${sections.join('\n\n')}
     };
   }
 
+  hasDocuments(): boolean {
+    const result = this.db.query(
+      'SELECT COUNT(*) as count FROM knowledge_documents'
+    ).get() as { count: number };
+
+    return result.count > 0;
+  }
+
+  getToolSummary(limit: number = 8): string {
+    const stats = this.getStats();
+    if (stats.totalDocuments === 0) {
+      return 'No knowledge documents are currently loaded.';
+    }
+
+    const rows = this.db.query(
+      `SELECT title, topic, keywords
+       FROM knowledge_documents
+       ORDER BY priority DESC, usage_count DESC, title ASC
+       LIMIT ?`
+    ).all(limit) as Array<{ title: string; topic: string; keywords: string }>;
+
+    const topics = this.listTopics().slice(0, 6);
+    const topicSummary = topics.length > 0 ? topics.join(', ') : 'none listed';
+
+    const documents = rows.map((row) => {
+      const keywords = (JSON.parse(row.keywords || '[]') as string[]).slice(0, 3);
+      const keywordSummary = keywords.length > 0 ? `; keywords: ${keywords.join(', ')}` : '';
+      return `"${row.title}" (topic: ${row.topic}${keywordSummary})`;
+    });
+
+    const remaining = stats.totalDocuments > rows.length
+      ? ` There are ${stats.totalDocuments - rows.length} more documents beyond this preview.`
+      : '';
+
+    return `Knowledge base has ${stats.totalDocuments} documents across ${stats.totalTopics} topics. Topics: ${topicSummary}. Document preview: ${documents.join('; ')}.${remaining}`;
+  }
+
+  private buildPreview(content: string, maxLength: number = 220): string {
+    const normalized = content.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) {
+      return normalized;
+    }
+
+    return normalized.slice(0, maxLength - 3).trimEnd() + '...';
+  }
+
+  private buildExcerpt(content: string, maxLength: number = 700): string {
+    return this.buildPreview(content, maxLength);
+  }
+
   /**
    * Map database row to KnowledgeDocument
    */
@@ -452,6 +623,76 @@ ${sections.join('\n\n')}
     }
 
     console.log(`📚 [KNOWLEDGE GRAPH] Bulk imported ${documents.length} documents`);
+  }
+
+  /**
+   * Sync knowledge documents from the knowledge_documents/ directory on disk.
+   * New documents (by title+topic) are inserted; existing documents with changed content are updated.
+   * This is safe to call on every startup.
+   */
+  async syncFromFiles(dirPath: string = './knowledge_documents'): Promise<void> {
+    const resolvedPath = resolve(dirPath);
+
+    if (!existsSync(resolvedPath)) {
+      console.log(`📚 [KNOWLEDGE GRAPH] No knowledge_documents directory found at ${resolvedPath}, skipping file sync`);
+      return;
+    }
+
+    const docs = await importMarkdownDirectory(resolvedPath);
+
+    if (docs.length === 0) {
+      console.log('📚 [KNOWLEDGE GRAPH] No markdown documents found to sync');
+      return;
+    }
+
+    let added = 0;
+    let updated = 0;
+    let unchanged = 0;
+
+    for (const doc of docs) {
+      // Look for an existing document with the same title and topic
+      const existing = this.db.query(
+        'SELECT id, content, keywords, type, url, priority FROM knowledge_documents WHERE LOWER(title) = LOWER(?) AND LOWER(topic) = LOWER(?)'
+      ).get(doc.title, doc.topic) as any | null;
+
+      if (existing) {
+        // Check if content or metadata changed
+        const existingKeywords = JSON.parse(existing.keywords) as string[];
+        const newKeywords = doc.keywords.map(k => k.toLowerCase());
+        const contentChanged = existing.content !== doc.content;
+        const keywordsChanged = JSON.stringify(existingKeywords.sort()) !== JSON.stringify(newKeywords.sort());
+        const metaChanged = existing.type !== doc.type
+          || existing.url !== (doc.url || null)
+          || existing.priority !== doc.priority;
+
+        if (contentChanged || keywordsChanged || metaChanged) {
+          this.updateDocument(existing.id, {
+            content: doc.content,
+            keywords: doc.keywords,
+            type: doc.type,
+            url: doc.url,
+            priority: doc.priority,
+          });
+          updated++;
+        } else {
+          unchanged++;
+        }
+      } else {
+        // New document — insert it
+        this.storeDocument({
+          topic: doc.topic,
+          title: doc.title,
+          content: doc.content,
+          keywords: doc.keywords,
+          type: doc.type,
+          url: doc.url,
+          priority: doc.priority,
+        });
+        added++;
+      }
+    }
+
+    console.log(`📚 [KNOWLEDGE GRAPH] File sync complete: ${added} added, ${updated} updated, ${unchanged} unchanged (${docs.length} files scanned)`);
   }
 
   /**
