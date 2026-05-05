@@ -27,7 +27,19 @@ const command: Command = {
       subcommand
         .setName('clear')
         .setDescription('Clear all memories (owner only)')
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName('clear-user')
+        .setDescription('Clear stored opinion for a user ID (owner only)')
+        .addStringOption((option) =>
+          option
+            .setName('user-id')
+            .setDescription('Discord user ID whose stored opinion should be cleared')
+            .setRequired(true)
+        )
     ) as SlashCommandBuilder,
+  ownerOnlySubcommands: ['clear', 'clear-user'],
 
   async execute(interaction: ChatInputCommandInteraction) {
     const subcommand = interaction.options.getSubcommand();
@@ -117,6 +129,17 @@ const command: Command = {
         // For now, just return info
         await interaction.reply({
           content: 'This command would clear all user memories. Feature available to bot owner only.',
+          ephemeral: true,
+        });
+      } else if (subcommand === 'clear-user') {
+        const userId = interaction.options.getString('user-id', true);
+        const opinion = userMemoryService.getOpinion(userId);
+        const deletedCount = userMemoryService.deleteOpinion(userId);
+
+        await interaction.reply({
+          content: deletedCount > 0
+            ? `✅ Cleared stored opinion for ${opinion?.username || userId} (${userId}).`
+            : `No stored opinion found for user ID ${userId}.`,
           ephemeral: true,
         });
       }

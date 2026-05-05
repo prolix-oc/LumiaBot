@@ -17,7 +17,7 @@ export const config = {
     name: process.env.BOT_NAME || 'Bad Kitty',
     familyName: process.env.BOT_FAMILY_NAME || '',
     ownerName: process.env.BOT_OWNER_NAME || 'Prolix',
-    ownerId: process.env.BOT_OWNER_ID || '944783522059673691',
+    ownerId: process.env.OWNER_ID || process.env.BOT_OWNER_ID || '944783522059673691',
     ownerUsername: process.env.BOT_OWNER_USERNAME || 'prolix_oc',
   },
   openai: {

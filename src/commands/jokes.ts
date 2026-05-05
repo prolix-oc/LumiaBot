@@ -10,7 +10,7 @@ const command: Command = {
     .addSubcommand((subcommand) =>
       subcommand
         .setName('add')
-        .setDescription('Add a new inside joke')
+        .setDescription('Add a new inside joke (owner only)')
         .addStringOption((option) =>
           option
             .setName('joke')
@@ -37,7 +37,7 @@ const command: Command = {
     .addSubcommand((subcommand) =>
       subcommand
         .setName('delete')
-        .setDescription('Delete an inside joke (requires joke ID)')
+        .setDescription('Delete an inside joke (owner only)')
         .addIntegerOption((option) =>
           option
             .setName('id')
@@ -45,6 +45,7 @@ const command: Command = {
             .setRequired(true)
         )
     ) as SlashCommandBuilder,
+  ownerOnlySubcommands: ['add', 'delete'],
 
   async execute(interaction: ChatInputCommandInteraction) {
     const subcommand = interaction.options.getSubcommand();

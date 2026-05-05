@@ -8,6 +8,7 @@ const balanceCommand: Command = {
   data: new SlashCommandBuilder()
     .setName('balance')
     .setDescription('Check the Moonshot API account balance (owner only)') as SlashCommandBuilder,
+  ownerOnly: true,
 
   async execute(interaction: ChatInputCommandInteraction) {
     if (interaction.user.id !== config.bot.ownerId) {

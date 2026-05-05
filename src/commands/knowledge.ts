@@ -1,4 +1,4 @@
-import { SlashCommandBuilder, PermissionFlagsBits, ChatInputCommandInteraction } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
 import { knowledgeGraphService } from '../services/knowledge-graph';
 import type { Command } from '../bot/client';
 
@@ -6,7 +6,6 @@ const command: Command = {
   data: new SlashCommandBuilder()
     .setName('knowledge')
     .setDescription('Manage the knowledge graph')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand(subcommand =>
       subcommand
         .setName('add')
@@ -132,6 +131,7 @@ const command: Command = {
             .setRequired(true)
         )
     ),
+  ownerOnlySubcommands: ['add', 'delete', 'clear', 'clear-topic'],
 
   async execute(interaction: ChatInputCommandInteraction) {
     const subcommand = interaction.options.getSubcommand();

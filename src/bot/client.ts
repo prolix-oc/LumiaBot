@@ -21,6 +21,8 @@ export interface Command {
     description: string;
     toJSON: () => unknown;
   };
+  ownerOnly?: boolean;
+  ownerOnlySubcommands?: readonly string[];
   execute: (interaction: ChatInputCommandInteraction) => Promise<void>;
 }
 
@@ -1073,6 +1075,18 @@ ${sections.join('\n\n')}
       }
 
       try {
+        const subcommand = interaction.options.getSubcommand(false);
+        const ownerOnly = command.ownerOnly ||
+          (subcommand !== null && command.ownerOnlySubcommands?.includes(subcommand));
+
+        if (ownerOnly && interaction.user.id !== config.bot.ownerId) {
+          await interaction.reply({
+            content: 'This command is only available to the bot owner.',
+            ephemeral: true,
+          });
+          return;
+        }
+
         await command.execute(interaction);
       } catch (error) {
         console.error(error);

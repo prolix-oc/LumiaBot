@@ -381,9 +381,10 @@ export class UserMemoryService {
   /**
    * Delete a user's opinion
    */
-  deleteOpinion(userId: string): void {
-    this.db.run('DELETE FROM user_opinions WHERE user_id = ?', [userId]);
-    console.log(`💾 [USER MEMORY] Deleted opinion for user ${userId}`);
+  deleteOpinion(userId: string): number {
+    const result = this.db.run('DELETE FROM user_opinions WHERE user_id = ?', [userId]);
+    console.log(`💾 [USER MEMORY] Deleted ${result.changes} opinion row(s) for user ${userId}`);
+    return result.changes;
   }
 
   /**

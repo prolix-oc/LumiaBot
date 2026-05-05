@@ -21,7 +21,19 @@ const command: Command = {
       subcommand
         .setName('clear')
         .setDescription('Clear your conversation history')
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName('clear-user')
+        .setDescription('Clear stored conversation history for a user ID (owner only)')
+        .addStringOption((option) =>
+          option
+            .setName('user-id')
+            .setDescription('Discord user ID whose conversation history should be cleared')
+            .setRequired(true)
+        )
     ) as SlashCommandBuilder,
+  ownerOnlySubcommands: ['clear-user'],
 
   async execute(interaction: ChatInputCommandInteraction) {
     const subcommand = interaction.options.getSubcommand();
@@ -107,6 +119,17 @@ const command: Command = {
         
         await interaction.reply({
           content: '✅ Your conversation history has been cleared. Starting fresh!',
+          ephemeral: true,
+        });
+      } else if (subcommand === 'clear-user') {
+        const targetUserId = interaction.options.getString('user-id', true);
+        const conversations = conversationHistoryService.listUserConversations(targetUserId);
+        const deletedCount = conversationHistoryService.clearAllHistory(targetUserId);
+
+        await interaction.reply({
+          content: deletedCount > 0
+            ? `✅ Cleared ${deletedCount} stored conversation message${deletedCount === 1 ? '' : 's'} for user ID ${targetUserId} across ${conversations.length} location${conversations.length === 1 ? '' : 's'}.`
+            : `No stored conversation history found for user ID ${targetUserId}.`,
           ephemeral: true,
         });
       }

@@ -20,13 +20,18 @@ const musicCommand: Command = {
     .addSubcommand(subcommand =>
       subcommand
         .setName('import')
-        .setDescription('Import a Spotify playlist into Lumia\'s music knowledge')
+        .setDescription('Import a Spotify playlist into Lumia\'s music knowledge (owner only)')
         .addStringOption(option =>
           option
             .setName('url')
             .setDescription('Spotify playlist URL or ID')
             .setRequired(true)
         )
+    )
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('refresh')
+        .setDescription('Refresh all saved Spotify playlists (owner only)')
     )
     .addSubcommand(subcommand =>
       subcommand
@@ -46,7 +51,7 @@ const musicCommand: Command = {
     .addSubcommand(subcommand =>
       subcommand
         .setName('delete')
-        .setDescription('Delete an imported playlist')
+        .setDescription('Delete an imported playlist (owner only)')
         .addIntegerOption(option =>
           option
             .setName('id')
@@ -68,8 +73,9 @@ const musicCommand: Command = {
     .addSubcommand(subcommand =>
       subcommand
         .setName('clear-all')
-        .setDescription('⚠️ Delete ALL music data (admin only)')
+        .setDescription('⚠️ Delete ALL music data (owner only)')
     ) as SlashCommandBuilder,
+  ownerOnlySubcommands: ['import', 'refresh', 'delete', 'clear-all'],
 
   async execute(interaction: ChatInputCommandInteraction) {
   const subcommand = interaction.options.getSubcommand();
@@ -78,6 +84,9 @@ const musicCommand: Command = {
     switch (subcommand) {
       case 'import':
         await handleImport(interaction);
+        break;
+      case 'refresh':
+        await handleRefresh(interaction);
         break;
       case 'list':
         await handleList(interaction);
@@ -310,6 +319,80 @@ async function handleList(interaction: ChatInputCommandInteraction) {
   }
 }
 
+async function handleRefresh(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  if (!spotifyService.isAvailable()) {
+    await interaction.editReply({
+      content: '❌ Spotify is not configured. Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables.',
+    });
+    return;
+  }
+
+  const playlists = musicService.getAllPlaylists();
+
+  if (playlists.length === 0) {
+    await interaction.editReply({
+      content: '🎵 No saved playlists to refresh yet. Use `/music import` first.',
+    });
+    return;
+  }
+
+  await interaction.editReply({
+    content: `🎵 Refreshing ${playlists.length} saved playlist${playlists.length === 1 ? '' : 's'} from Spotify...`,
+  });
+
+  let refreshedCount = 0;
+  let totalTracks = 0;
+  let newTracks = 0;
+  const failures: string[] = [];
+
+  for (const playlist of playlists) {
+    try {
+      const spotifyPlaylist = await spotifyService.getPlaylist(playlist.spotifyId);
+      const result = await musicService.importPlaylist(
+        spotifyPlaylist,
+        spotifyPlaylist.tracks.items
+      );
+
+      refreshedCount++;
+      totalTracks += result.importedTracks;
+      newTracks += result.newTracks;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      failures.push(`${playlist.name}: ${message}`);
+      console.error(`❌ [MUSIC REFRESH] Failed to refresh playlist ${playlist.spotifyId}:`, error);
+    }
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🎵 Playlist Refresh Complete')
+    .setColor(failures.length > 0 ? 0xFFA500 : 0x1DB954)
+    .addFields(
+      { name: 'Refreshed', value: `${refreshedCount}/${playlists.length} playlists`, inline: true },
+      { name: 'Tracks Linked', value: `${totalTracks}`, inline: true },
+      { name: 'New Tracks', value: `${newTracks}`, inline: true }
+    )
+    .setTimestamp();
+
+  if (failures.length > 0) {
+    const failureText = failures
+      .slice(0, 5)
+      .map(failure => `• ${failure}`)
+      .join('\n');
+    embed.addFields({
+      name: `Failures (${failures.length})`,
+      value: failures.length > 5 ? `${failureText}\n...and ${failures.length - 5} more` : failureText,
+      inline: false,
+    });
+  }
+
+  await interaction.editReply({
+    content: refreshedCount > 0 ? '✅ Saved playlists refreshed.' : '❌ No playlists could be refreshed.',
+    embeds: [embed],
+  });
+}
+
 async function handleStats(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ ephemeral: true });
 
@@ -457,15 +540,6 @@ async function handleTaste(interaction: ChatInputCommandInteraction) {
 }
 
 async function handleDelete(interaction: ChatInputCommandInteraction) {
-  // Only admins can delete
-  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-    await interaction.reply({
-      content: '❌ Only administrators can delete playlists!',
-      ephemeral: true,
-    });
-    return;
-  }
-
   await interaction.deferReply({ ephemeral: true });
 
   const playlistId = interaction.options.getInteger('id', true);
@@ -570,15 +644,6 @@ async function handleSearch(interaction: ChatInputCommandInteraction) {
 }
 
 async function handleClearAll(interaction: ChatInputCommandInteraction) {
-  // Only admins can clear all
-  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-    await interaction.reply({
-      content: '❌ Only administrators can clear all music data!',
-      ephemeral: true,
-    });
-    return;
-  }
-
   await interaction.deferReply({ ephemeral: true });
 
   const stats = musicService.getStats();

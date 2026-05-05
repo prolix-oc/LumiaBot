@@ -188,7 +188,7 @@ export class ConversationHistoryService {
   /**
    * Clear all conversation history for a user across all guilds
    */
-  clearAllHistory(userId: string): void {
+  clearAllHistory(userId: string): number {
     const result = this.db.run(
       'DELETE FROM conversation_messages WHERE user_id = ?',
       [userId]
@@ -197,6 +197,8 @@ export class ConversationHistoryService {
     if (result.changes > 0) {
       console.log(`💬 [CONVERSATION] Cleared ${result.changes} messages for user ${userId} across all guilds`);
     }
+
+    return result.changes;
   }
 
   /**
