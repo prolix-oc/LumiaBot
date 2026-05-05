@@ -1,16 +1,19 @@
-import { Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember, StickerFormatType } from 'discord.js';
+import { Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember, StickerFormatType, userMention } from 'discord.js';
 import { config } from '../utils/config';
 import { shouldTriggerBot, extractMessageContent, handleMessage, extractTriggerKeywords } from '../services/message-handler';
 import { boredomService, getRandomBoredomMessage } from '../services/boredom';
 import { channelHistoryService } from '../services/channel-history';
 import { getErrorMessage, getTriggerKeywords } from '../services/prompts';
 import { userActivityService } from '../services/user-activity';
+import { userMemoryService } from '../services/user-memory';
 import { pageExtractorService } from '../services/page-extractor';
 import { knowledgeGraphService } from '../services/knowledge-graph';
+import { formatDiscordResponseText } from '../utils/discord-markdown';
 import type { ChatInputCommandInteraction } from 'discord.js';
 import { LumiaBotIntegration } from '../services/orchestrator';
 import { orchestratorTurnJournal } from '../services/orchestrator/turn-journal';
 import type { MessageContext, ReplyContext, MediaAttachment, TextAttachment, ResponseRequestPayload, CollectiveKnowledgeResultPayload } from '../services/orchestrator/types';
+import type { ResolvedUserMention, ResolveUserMention } from '../services/user-mention-resolver';
 
 export interface Command {
   data: {
@@ -170,6 +173,36 @@ function isReplyReferenceFailure(error: unknown): boolean {
   return code === 10008 || message.includes('Unknown Message');
 }
 
+function getMessageAuthorDisplayName(message: Message): string {
+  return message.member?.displayName || message.author.displayName || message.author.username;
+}
+
+function getMentionedUserDisplayMap(message: Message): Map<string, string> {
+  const mentionedUsers = new Map<string, string>();
+
+  if (message.mentions.members && message.mentions.members.size > 0) {
+    message.mentions.members.forEach((member) => {
+      mentionedUsers.set(member.id, member.displayName || member.user.displayName || member.user.username);
+    });
+  }
+
+  message.mentions.users.forEach((user) => {
+    if (!mentionedUsers.has(user.id)) {
+      mentionedUsers.set(user.id, user.displayName || user.username);
+    }
+  });
+
+  return mentionedUsers;
+}
+
+function buildAllowedMentions(userIds: Iterable<string>) {
+  return {
+    parse: [],
+    users: Array.from(new Set(userIds)),
+    repliedUser: false,
+  };
+}
+
 export class DiscordBot {
   public client: Client;
   public commands: Collection<string, Command>;
@@ -268,6 +301,84 @@ export class DiscordBot {
     }
 
     return lines.length > 0 ? lines.join('\n') : undefined;
+  }
+
+  private buildUserMentionResolver(
+    message: Message,
+    allowedMentionUserIds: Set<string>,
+  ): ResolveUserMention | undefined {
+    const guild = message.guild;
+    if (!guild) {
+      return undefined;
+    }
+
+    const addResult = (
+      results: ResolvedUserMention[],
+      seen: Set<string>,
+      member: GuildMember,
+      source: ResolvedUserMention['source'],
+      matchScore?: number,
+    ) => {
+      if (seen.has(member.id)) return;
+
+      seen.add(member.id);
+      allowedMentionUserIds.add(member.id);
+      results.push({
+        userId: member.id,
+        username: member.user.username,
+        displayName: member.displayName || member.user.displayName || member.user.username,
+        mention: userMention(member.id),
+        source,
+        matchScore,
+      });
+    };
+
+    return async (query: string, maxResults: number = 5) => {
+      const normalizedQuery = query.trim().toLowerCase();
+      if (!normalizedQuery) {
+        return [];
+      }
+
+      const limit = Math.max(1, Math.min(maxResults || 5, 10));
+      const results: ResolvedUserMention[] = [];
+      const seen = new Set<string>();
+
+      if (message.mentions.members) {
+        message.mentions.members.forEach((member) => {
+          const displayName = member.displayName.toLowerCase();
+          const username = member.user.username.toLowerCase();
+          if (displayName.includes(normalizedQuery) || username.includes(normalizedQuery)) {
+            addResult(results, seen, member, 'current-message');
+          }
+        });
+      }
+
+      const memoryMatches = userMemoryService.searchUsers(query, limit);
+      for (const match of memoryMatches) {
+        if (results.length >= limit) break;
+        try {
+          const member = await guild.members.fetch(match.userId);
+          addResult(results, seen, member, 'memory', match.matchScore);
+        } catch {
+          // The bot may remember users who are no longer in this guild.
+        }
+      }
+
+      if (results.length < limit) {
+        try {
+          const guildMatches = await guild.members.fetch({ query, limit });
+          guildMatches.forEach((member) => {
+            if (results.length < limit) {
+              addResult(results, seen, member, 'guild-search');
+            }
+          });
+        } catch (error) {
+          console.warn(`👥 [CLIENT] Guild member search failed for "${query}":`, error);
+        }
+      }
+
+      return results;
+    };
   }
 
   private normalizeOrchestratorResponse(text: string): string {
@@ -446,7 +557,14 @@ ${sections.join('\n\n')}
 
       if (journalTurn.state === 'generated') {
         console.log(`[Orchestrator] Replaying cached generated response for turn ${turnId}`);
-        const replayedMessage = await this.sendOrchestratorResponseToDiscord(message, context, journalTurn.responseText, eventId, turnId);
+        const replayedMessage = await this.sendOrchestratorResponseToDiscord(
+          message,
+          context,
+          journalTurn.responseText,
+          eventId,
+          turnId,
+          getMentionedUserDisplayMap(message).keys(),
+        );
         if (!replayedMessage) {
           orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, '', payload);
           return '';
@@ -476,11 +594,12 @@ ${sections.join('\n\n')}
       // In orchestrator mode the message content contains raw <@id> patterns;
       // resolving them here gives the AI system prompt the "USERS MENTIONED"
       // section and enables user-related tools (opinions, pronouns, etc.).
-      const mentionedUsers = new Map<string, string>();
-      if (message.mentions.users.size > 0) {
-        message.mentions.users.forEach((user) => {
-          mentionedUsers.set(user.id, user.username);
-          console.log(`👥 [Orchestrator] User mentioned: ${user.username} (${user.id})`);
+      const mentionedUsers = getMentionedUserDisplayMap(message);
+      const allowedMentionUserIds = new Set<string>(mentionedUsers.keys());
+      const resolveUserMention = this.buildUserMentionResolver(message, allowedMentionUserIds);
+      if (mentionedUsers.size > 0) {
+        mentionedUsers.forEach((name, id) => {
+          console.log(`👥 [Orchestrator] User mentioned: ${name} (${id})`);
         });
       }
 
@@ -496,8 +615,9 @@ ${sections.join('\n\n')}
               try {
                 const member = message.guild.members.cache.get(userId);
                 if (member) {
-                  mentionedUsers.set(userId, member.user.username);
-                  console.log(`👥 [Orchestrator] Resolved mention from context: ${member.user.username} (${userId})`);
+                  mentionedUsers.set(userId, member.displayName || member.user.displayName || member.user.username);
+                  allowedMentionUserIds.add(userId);
+                  console.log(`👥 [Orchestrator] Resolved mention from context: ${member.displayName} (${userId})`);
                 }
               } catch {
                 // Silently skip unresolvable mentions
@@ -579,6 +699,7 @@ ${sections.join('\n\n')}
           currentBotId: this.client.user?.id,
         },
         getUserListeningActivity,
+        resolveUserMention,
         // Orchestrator follow-up support: allow the LLM to request another turn
         orchestratorEventId: eventId,
         orchestratorTurnId: turnId,
@@ -612,6 +733,7 @@ ${sections.join('\n\n')}
             currentBotId: this.client.user?.id,
           },
           getUserListeningActivity,
+          resolveUserMention,
           orchestratorEventId: eventId,
           orchestratorTurnId: turnId,
           requestFollowUp: this.orchestrator
@@ -630,7 +752,7 @@ ${sections.join('\n\n')}
 
       // Send the response directly to Discord
       if (response.text && response.text.trim()) {
-        const sentMessage = await this.sendOrchestratorResponseToDiscord(message, context, response.text, eventId, turnId);
+        const sentMessage = await this.sendOrchestratorResponseToDiscord(message, context, response.text, eventId, turnId, allowedMentionUserIds);
         if (!sentMessage) {
           orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, '', payload);
           return '';
@@ -695,6 +817,7 @@ ${sections.join('\n\n')}
     responseText: string,
     eventId: string,
     turnId: string,
+    allowedMentionUserIds: Iterable<string> = [],
   ): Promise<Message | null> {
     if (!context.replyToMessageId && this.hasAlreadyReplied(message.id)) {
       console.warn(`⚠️ [Orchestrator] Suppressing duplicate reply for message ${message.id} (orchestrator path blocked by cross-path guard)`);
@@ -703,15 +826,20 @@ ${sections.join('\n\n')}
 
     console.log(`[Orchestrator] Sending response to Discord for event ${eventId}, turn ${turnId}`);
 
+    const formattedResponseText = formatDiscordResponseText(responseText);
+    const allowedMentions = buildAllowedMentions(allowedMentionUserIds);
+
     let sentMessage;
     if (context.replyToMessageId && 'send' in message.channel) {
       sentMessage = await message.channel.send({
-        content: responseText,
+        content: formattedResponseText,
+        allowedMentions,
         reply: { messageReference: context.replyToMessageId, failIfNotExists: false },
       });
     } else {
       sentMessage = await message.reply({
-        content: responseText,
+        content: formattedResponseText,
+        allowedMentions,
         failIfNotExists: false,
       });
     }
@@ -1016,7 +1144,8 @@ ${sections.join('\n\n')}
           // Check if the referenced message is from Lumia (the bot)
           const isReplyToLumia = referencedMessage.author.id === botId;
           
-          console.log(`💬 [CLIENT] Reply detected to ${isReplyToLumia ? 'Lumia' : referencedMessage.author.username}: "${referencedMessage.content.slice(0, 100)}..."`);
+          const referencedAuthorName = getMessageAuthorDisplayName(referencedMessage);
+          console.log(`💬 [CLIENT] Reply detected to ${isReplyToLumia ? 'Lumia' : referencedAuthorName}: "${referencedMessage.content.slice(0, 100)}..."`);
           
           // Extract embedded content from referenced message
           const embeddedImages: string[] = [];
@@ -1100,7 +1229,7 @@ ${sections.join('\n\n')}
             isReplyToLumia,
             originalContent: originalContentWithStickers,
             originalTimestamp: formatTimeAgo(referencedMessage.createdAt),
-            originalAuthor: referencedMessage.author.username,
+            originalAuthor: referencedAuthorName,
             embeddedContent: {
               images: embeddedImages,
               videos: embeddedVideos,
@@ -1355,12 +1484,14 @@ ${sections.join('\n\n')}
         videoUrls.push(...replyContext.embeddedContent.videos);
       }
 
-      // Extract mentioned users for context parsing
-      const mentionedUsers = new Map<string, string>();
-      if (message.mentions.users.size > 0) {
-        message.mentions.users.forEach((user) => {
-          mentionedUsers.set(user.id, user.username);
-          console.log(`👥 [CLIENT] User mentioned: ${user.username} (${user.id})`);
+      // Extract mentioned users for context parsing, using guild display names when available.
+      const mentionedUsers = getMentionedUserDisplayMap(message);
+      const allowedMentionUserIds = new Set<string>(mentionedUsers.keys());
+      const resolveUserMention = this.buildUserMentionResolver(message, allowedMentionUserIds);
+      const authorDisplayName = getMessageAuthorDisplayName(message);
+      if (mentionedUsers.size > 0) {
+        mentionedUsers.forEach((name, id) => {
+          console.log(`👥 [CLIENT] User mentioned: ${name} (${id})`);
         });
       }
 
@@ -1423,7 +1554,7 @@ ${sections.join('\n\n')}
         textAttachments,
         pageContents: pageContents.length > 0 ? pageContents : undefined,
         userId: message.author.id,
-        username: message.author.username,
+        username: authorDisplayName,
         guildId: message.guildId || 'dm',
         mentionedUsers,
         replyContext: replyContext ? {
@@ -1436,6 +1567,7 @@ ${sections.join('\n\n')}
         boredomAction,
         channelMessages: channelTurns,
         getUserListeningActivity,
+        resolveUserMention,
         requestCollectiveKnowledge,
       });
 
@@ -1449,10 +1581,10 @@ ${sections.join('\n\n')}
         return;
       }
 
-      // Discord has a 2000 character limit for messages
-      const truncatedResponse = response.text.length > 1950
-        ? response.text.slice(0, 1950) + '... (message truncated)'
-        : response.text;
+      // Discord has a 2000 character limit for messages; escape before truncating
+      // because inserted Markdown backslashes count toward that limit.
+      const formattedResponse = formatDiscordResponseText(response.text);
+      const allowedMentions = buildAllowedMentions(allowedMentionUserIds);
 
       // Check if channel is still available before sending (bot may have been kicked)
       if (!message.channel) {
@@ -1466,7 +1598,8 @@ ${sections.join('\n\n')}
       let sentMessage;
       try {
         sentMessage = await message.reply({
-          content: truncatedResponse,
+          content: formattedResponse,
+          allowedMentions,
           failIfNotExists: false,
         });
       } catch (replyError) {
@@ -1484,7 +1617,8 @@ ${sections.join('\n\n')}
             message.channel instanceof StageChannel ||
             message.channel instanceof DMChannel) {
           sentMessage = await message.channel.send({
-            content: `${message.author} ${truncatedResponse}`,
+            content: `${message.author} ${formattedResponse}`,
+            allowedMentions: buildAllowedMentions([...allowedMentionUserIds, message.author.id]),
           });
         } else {
           throw replyError;

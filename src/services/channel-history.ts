@@ -147,7 +147,7 @@ export class ChannelHistoryService {
         processedMessages.push({
           id: message.id,
           authorId: message.author.id,
-          authorUsername: message.author.username,
+          authorUsername: message.member?.displayName || message.author.displayName || message.author.username,
           content: content,
           timestamp: message.createdAt,
           isBot: message.author.bot,

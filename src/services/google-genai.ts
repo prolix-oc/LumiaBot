@@ -11,6 +11,7 @@ import { boredomService } from './boredom';
 import { conversationHistoryService } from './conversation-history';
 import { guildMemoryService } from './guild-memory';
 import { userActivityService, type MusicActivity } from './user-activity';
+import type { ResolveUserMention } from './user-mention-resolver';
 import {
   getVideoReactionInstructions,
   getBoredomUpdateInstructions,
@@ -91,6 +92,7 @@ export interface ChatCompletionOptions {
   enableMusicTaste?: boolean;
   conversationSummary?: string; // Per-user past interaction summary for system prompt
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
+  resolveUserMention?: ResolveUserMention;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
   // Orchestrator follow-up support
   orchestratorEventId?: string; // The event ID for the current orchestrated conversation
@@ -694,6 +696,27 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       });
     }
 
+    if (options.resolveUserMention) {
+      tools.push({
+        name: 'resolve_user_mention',
+        description: 'Resolve a Discord user into a safe, mentionable <@userId> string for this guild. Use this when you want to actually ping someone by a name, nickname, display name, or remembered username. Only use a returned Mention value when the conversation clearly calls for pinging that person.',
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: 'The name, nickname, display name, username, or partial handle to resolve.',
+            },
+            maxResults: {
+              type: Type.NUMBER,
+              description: 'Maximum number of users to return (default: 5).',
+            },
+          },
+          required: ['query'],
+        },
+      });
+    }
+
     // User pronouns tool - always available if we have user context
     if (options.userId && options.username) {
       tools.push({
@@ -1060,6 +1083,31 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
             console.error('🎧 [Google GenAI] Error getting listening activity:', error);
             return 'Error: Failed to retrieve listening activity.';
           }
+        }
+
+        case 'resolve_user_mention': {
+          if (!options.resolveUserMention) {
+            return 'Error: User mention resolution is not available in this context.';
+          }
+
+          const results = await options.resolveUserMention(args.query, args.maxResults || 5);
+          if (results.length === 0) {
+            return `No mentionable guild users found for "${args.query}".`;
+          }
+
+          let response = `Resolved ${results.length} mentionable user(s) for "${args.query}":\n`;
+          results.forEach((result, index) => {
+            response += `\n${index + 1}. ${result.displayName} (@${result.username})`;
+            response += `\n   ID: ${result.userId}`;
+            response += `\n   Mention: ${result.mention}`;
+            response += `\n   Source: ${result.source}`;
+            if (typeof result.matchScore === 'number') {
+              response += `\n   Match score: ${result.matchScore}/100`;
+            }
+          });
+          response += '\n\nUse the Mention value exactly if you intentionally want to ping this user.';
+          console.log(`🔧 [Google GenAI] User mention resolution for "${args.query}" returned ${results.length} results`);
+          return response;
         }
 
         case 'get_user_pronouns': {

@@ -7,6 +7,7 @@ import { knowledgeGraphService, type KnowledgeCandidate } from './knowledge-grap
 import { config } from '../utils/config';
 import type { ChatMessage } from './openai';
 import type { MusicActivity } from './user-activity';
+import type { ResolveUserMention } from './user-mention-resolver';
 
 // Keywords that trigger the bot (case insensitive)
 // Loaded dynamically from prompt_storage/config/triggers.json
@@ -143,6 +144,7 @@ export interface MessageHandlerOptions {
     currentBotId?: string;
   };
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
+  resolveUserMention?: ResolveUserMention;
   // Orchestrator follow-up support
   orchestratorEventId?: string;
   orchestratorTurnId?: string;
@@ -246,7 +248,7 @@ async function processVisionContent(
  * @returns The bot's response with potential reactions
  */
 export async function handleMessage(options: MessageHandlerOptions): Promise<MessageHandlerResponse> {
-  const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, knowledgeCandidates, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, orchestratorContextNote, currentMessageSpeaker, getUserListeningActivity, orchestratorEventId, orchestratorTurnId, requestFollowUp, requestCollectiveKnowledge } = options;
+    const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, knowledgeCandidates, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, orchestratorContextNote, currentMessageSpeaker, getUserListeningActivity, resolveUserMention, orchestratorEventId, orchestratorTurnId, requestFollowUp, requestCollectiveKnowledge } = options;
 
   try {
     // Parse message for pronouns and mentions BEFORE processing
@@ -383,6 +385,7 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       orchestratorContextNote,
       conversationSummary: conversationSummary || undefined,
       getUserListeningActivity,
+      resolveUserMention,
       orchestratorEventId,
       orchestratorTurnId,
       requestFollowUp,

@@ -11,6 +11,7 @@ import { knowledgeGraphService } from './knowledge-graph';
 import type { KnowledgeCandidate } from './knowledge-graph';
 import { musicService, type MusicTrackWithDetails } from './music';
 import { userActivityService, type MusicActivity } from './user-activity';
+import type { ResolveUserMention } from './user-mention-resolver';
 import { getBotDefinition } from '../utils/bot-definition';
 import {
   getVideoReactionInstructions,
@@ -113,6 +114,7 @@ export interface ChatCompletionOptions {
   enableMusicTaste?: boolean; // DEPRECATED: Auto-inject music context (default: false). Use get_music_taste tool instead
   conversationSummary?: string; // Per-user past interaction summary for system prompt
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
+  resolveUserMention?: ResolveUserMention;
   mentionedUsers?: Map<string, string>; // userId -> username mapping for users mentioned in current message
   // Orchestrator follow-up support
   orchestratorEventId?: string;
@@ -987,7 +989,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     // Search is attached by default unless explicitly disabled.
     // Knowledge is attached when documents exist unless explicitly disabled.
     const hasUserContext = !!(userId && username);
-    const needsTools = enableSearch !== false || hasKnowledgeCandidates || hasUserContext || musicService.hasTracks() || !!options.getUserListeningActivity || !!options.orchestratorEventId || !!options.requestCollectiveKnowledge;
+    const needsTools = enableSearch !== false || hasKnowledgeCandidates || hasUserContext || musicService.hasTracks() || !!options.getUserListeningActivity || !!options.resolveUserMention || !!options.orchestratorEventId || !!options.requestCollectiveKnowledge;
 
     if (!needsTools) {
       console.log(`\n🌐 [AI] No tools needed (no user context or search) - normal completion`);
@@ -1248,6 +1250,37 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         } catch (error) {
           console.error('🎧 [AI] Error getting listening activity:', error);
           return 'Error: Failed to retrieve listening activity.';
+        }
+      };
+
+      const resolveUserMentionFunction = async (args: { query: string; maxResults?: number }) => {
+        if (!options.resolveUserMention) {
+          return 'Error: User mention resolution is not available in this context.';
+        }
+
+        console.log(`👥 [AI] Resolving user mention for "${args.query}"`);
+
+        try {
+          const results = await options.resolveUserMention(args.query, args.maxResults || 5);
+          if (results.length === 0) {
+            return `No mentionable guild users found for "${args.query}".`;
+          }
+
+          let response = `Resolved ${results.length} mentionable user(s) for "${args.query}":\n`;
+          results.forEach((result, index) => {
+            response += `\n${index + 1}. ${result.displayName} (@${result.username})`;
+            response += `\n   ID: ${result.userId}`;
+            response += `\n   Mention: ${result.mention}`;
+            response += `\n   Source: ${result.source}`;
+            if (typeof result.matchScore === 'number') {
+              response += `\n   Match score: ${result.matchScore}/100`;
+            }
+          });
+          response += '\n\nUse the Mention value exactly if you intentionally want to ping this user.';
+          return response;
+        } catch (error) {
+          console.error('👥 [AI] Failed to resolve user mention:', error);
+          return 'Error: Failed to resolve user mention.';
         }
       };
 
@@ -1537,6 +1570,32 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
                   description: "The Discord user ID of the person to check. Use the current user's ID if they ask about themselves, or a mentioned user's ID if asking about someone else.",
                 },
               },
+            },
+          },
+        });
+      }
+
+      if (options.resolveUserMention) {
+        tools.push({
+          type: 'function',
+          function: {
+            function: resolveUserMentionFunction,
+            parse: JSON.parse,
+            description: 'Resolve a Discord user into a safe, mentionable <@userId> string for this guild. Use this when you want to actually ping someone by a name, nickname, display name, or remembered username. Only use a returned Mention value when the conversation clearly calls for pinging that person.',
+            name: 'resolve_user_mention',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description: 'The name, nickname, display name, username, or partial handle to resolve.',
+                },
+                maxResults: {
+                  type: 'number',
+                  description: 'Maximum number of users to return (default: 5).',
+                },
+              },
+              required: ['query'],
             },
           },
         });
