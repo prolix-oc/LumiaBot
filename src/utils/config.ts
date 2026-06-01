@@ -6,6 +6,13 @@ function parseKnowledgeSourceMode(value: string | undefined): 0 | 1 | 2 {
   return 0;
 }
 
+function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  return value === 'true';
+}
+
 export const config = {
   discord: {
     token: process.env.DISCORD_TOKEN!,
@@ -19,6 +26,9 @@ export const config = {
     ownerName: process.env.BOT_OWNER_NAME || 'Prolix',
     ownerId: process.env.OWNER_ID || process.env.BOT_OWNER_ID || '944783522059673691',
     ownerUsername: process.env.BOT_OWNER_USERNAME || 'prolix_oc',
+    // When true, the bot only responds in Discord channels marked NSFW
+    // (reuses the same age-gating used for NSFW image generation).
+    nsfwOnly: parseBoolean(process.env.NSFW_ONLY, false),
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY!,
@@ -109,7 +119,9 @@ export const config = {
     // Unique bot identifier for the orchestrator
     botId: process.env.ORCHESTRATOR_BOT_ID || process.env.DISCORD_CLIENT_ID || 'lumia-bot',
     botName: process.env.ORCHESTRATOR_BOT_NAME || process.env.BOT_NAME || 'LumiaBot',
-    familyName: process.env.COUNCIL_FAMILY_NAME || process.env.BOT_FAMILY_NAME || '',
+    councilName: process.env.COUNCIL_NAME || process.env.COUNCIL_FAMILY_NAME || process.env.BOT_FAMILY_NAME || '',
+    councilParticipant: parseBoolean(process.env.ORCHESTRATOR_COUNCIL_PARTICIPANT, true),
+    familyName: process.env.COUNCIL_NAME || process.env.COUNCIL_FAMILY_NAME || process.env.BOT_FAMILY_NAME || '',
     // Reconnection settings
     reconnectIntervalMs: parseInt(process.env.ORCHESTRATOR_RECONNECT_INTERVAL || '5000'),
     maxReconnectAttempts: parseInt(process.env.ORCHESTRATOR_MAX_RECONNECT || '10'),

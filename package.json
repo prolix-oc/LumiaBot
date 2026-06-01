@@ -7,7 +7,8 @@
     "start": "bun run src/index.ts",
     "dev": "bun --hot run src/index.ts",
     "register-commands": "bun run src/scripts/register-commands.ts",
-    "wipe-memories": "bun run src/scripts/wipe-memories.ts"
+    "wipe-memories": "bun run src/scripts/wipe-memories.ts",
+    "import-docs": "bun run src/scripts/import-lumiverse-docs.ts"
   },
   "dependencies": {
     "@google/genai": "^1.40.0",

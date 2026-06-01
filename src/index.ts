@@ -38,6 +38,7 @@ async function main() {
       botName: config.bot.name,
       botFamily: config.bot.familyName,
       bot_family: config.bot.familyName,
+      councilName: config.orchestrator.councilName,
       ownerName: config.bot.ownerName,
       ownerId: config.bot.ownerId,
       ownerUsername: config.bot.ownerUsername,

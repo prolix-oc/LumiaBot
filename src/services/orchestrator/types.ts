@@ -4,6 +4,8 @@ export interface BotPresence {
   botId: string;
   botName: string;
   isOnline: boolean;
+  councilName?: string;
+  councilProfile?: string;
 }
 
 export interface CollectiveKnowledgeCandidate {

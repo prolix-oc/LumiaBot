@@ -3,11 +3,12 @@ import { parseMessage, storeParsedInformation } from './message-parser';
 import { conversationHistoryService } from './conversation-history';
 import { channelHistoryService } from './channel-history';
 import { getTriggerKeywords, getErrorMessage } from './prompts';
-import { knowledgeGraphService, type KnowledgeCandidate } from './knowledge-graph';
+import { knowledgeGraphService } from './knowledge-graph';
 import { config } from '../utils/config';
 import type { ChatMessage } from './openai';
 import type { MusicActivity } from './user-activity';
 import type { ResolveUserMention } from './user-mention-resolver';
+import type { GeneratedImageAttachment } from './swarmui';
 
 // Keywords that trigger the bot (case insensitive)
 // Loaded dynamically from prompt_storage/config/triggers.json
@@ -121,7 +122,6 @@ export interface MessageHandlerOptions {
   videoUrls?: { url: string; mimeType?: string }[]; // Video attachments for Gemini 3 models
   textAttachments?: { name: string; content: string }[]; // Text file attachments
   pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
-  knowledgeCandidates?: KnowledgeCandidate[];
   userId?: string;
   username?: string;
   guildId: string;
@@ -145,6 +145,7 @@ export interface MessageHandlerOptions {
   };
   getUserListeningActivity?: (userId: string) => Promise<MusicActivity | null>;
   resolveUserMention?: ResolveUserMention;
+  allowNsfwImageGeneration?: boolean;
   // Orchestrator follow-up support
   orchestratorEventId?: string;
   orchestratorTurnId?: string;
@@ -155,6 +156,7 @@ export interface MessageHandlerOptions {
 export interface MessageHandlerResponse {
   text: string;
   reactions: string[];
+  attachments: GeneratedImageAttachment[];
 }
 
 /**
@@ -248,7 +250,7 @@ async function processVisionContent(
  * @returns The bot's response with potential reactions
  */
 export async function handleMessage(options: MessageHandlerOptions): Promise<MessageHandlerResponse> {
-    const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, knowledgeCandidates, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, orchestratorContextNote, currentMessageSpeaker, getUserListeningActivity, resolveUserMention, orchestratorEventId, orchestratorTurnId, requestFollowUp, requestCollectiveKnowledge } = options;
+    const { content, enableSearch, enableKnowledgeGraph, imageUrls, videoUrls, textAttachments, pageContents, userId, username, guildId, mentionedUsers, replyContext, boredomAction, channelMessages, orchestratorContextNote, currentMessageSpeaker, getUserListeningActivity, resolveUserMention, allowNsfwImageGeneration, orchestratorEventId, orchestratorTurnId, requestFollowUp, requestCollectiveKnowledge } = options;
 
   try {
     // Parse message for pronouns and mentions BEFORE processing
@@ -271,9 +273,9 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
     const shouldSearch = enableSearch !== undefined ? enableSearch : true;
     const shouldQueryLocalKnowledge = enableKnowledgeGraph !== undefined
       ? enableKnowledgeGraph
-      : (config.knowledge.sourceMode === 0 || config.knowledge.sourceMode === 2) && knowledgeGraphService.hasDocuments();
+      : knowledgeGraphService.hasDocuments();
 
-    const shouldQueryCollectiveKnowledge = typeof requestCollectiveKnowledge === 'function' && (config.knowledge.sourceMode === 1 || config.knowledge.sourceMode === 2);
+    const shouldQueryCollectiveKnowledge = typeof requestCollectiveKnowledge === 'function';
 
     if (shouldSearch) {
       console.log(`🔍 [HANDLER] Web search tool will be attached for model-directed use`);
@@ -281,16 +283,9 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       console.log(`🔍 [HANDLER] Web search tool is disabled for this message`);
     }
 
-    const resolvedKnowledgeCandidates = shouldQueryLocalKnowledge
-      ? (knowledgeCandidates || knowledgeGraphService.findCandidateDocuments(content, 5))
-      : [];
-
-    if (resolvedKnowledgeCandidates.length > 0) {
-      console.log(`📚 [HANDLER] Knowledge document tool will be attached with deterministic candidates`);
-      console.log(`📚 [HANDLER] Found ${resolvedKnowledgeCandidates.length} deterministic knowledge candidate(s): ${resolvedKnowledgeCandidates.map((candidate) => `${candidate.id}:${candidate.title}`).join(', ')}`);
-    } else if (shouldQueryLocalKnowledge) {
-      console.log(`📚 [HANDLER] Knowledge tool not attached because no deterministic candidates matched`);
-      console.log(`📚 [HANDLER] No deterministic knowledge candidates matched this message`);
+    if (shouldQueryLocalKnowledge) {
+      const stats = knowledgeGraphService.getStats();
+      console.log(`📚 [HANDLER] Knowledge search tool will be attached (${stats.totalDocuments} docs across ${stats.totalTopics} topics)`);
     } else {
       console.log(`📚 [HANDLER] Local knowledge base tool is disabled or has no documents`);
     }
@@ -365,12 +360,12 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       currentMessageTurn,
     ];
 
+    const generatedImages: GeneratedImageAttachment[] = [];
     const aiService = getAIService();
     const response = await aiService.createChatCompletion({
       messages: finalTurns,
       enableSearch: shouldSearch,
       enableKnowledgeGraph: shouldQueryLocalKnowledge,
-      knowledgeCandidates: resolvedKnowledgeCandidates,
       collectiveKnowledgeContext,
       images: processedImages, // Only pass images if not using vision secondary model
       videos: processedVideos, // Only pass videos if not using vision secondary model
@@ -386,10 +381,12 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       conversationSummary: conversationSummary || undefined,
       getUserListeningActivity,
       resolveUserMention,
+      allowNsfwImageGeneration,
       orchestratorEventId,
       orchestratorTurnId,
       requestFollowUp,
       requestCollectiveKnowledge,
+      onImageGenerated: (image: GeneratedImageAttachment) => generatedImages.push(image),
     });
 
     // Extract reactions from the response
@@ -404,7 +401,7 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
       conversationHistoryService.addMessage(userId, guildId, username, 'assistant', text);
     }
 
-    return { text, reactions };
+    return { text, reactions, attachments: generatedImages };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error(`❌ [HANDLER] ${errorMessage}`);
@@ -414,18 +411,21 @@ export async function handleMessage(options: MessageHandlerOptions): Promise<Mes
         errorMessage.includes('Failed to generate response')) {
       return {
         text: getErrorMessage('multiple_attempts_failure'),
-        reactions: []
+        reactions: [],
+        attachments: []
       };
     } else if (errorMessage.includes('Empty response')) {
       return {
         text: getErrorMessage('empty_response'),
-        reactions: []
+        reactions: [],
+        attachments: []
       };
     }
     
     return {
       text: getErrorMessage('generic_error'),
-      reactions: []
+      reactions: [],
+      attachments: []
     };
   }
 }

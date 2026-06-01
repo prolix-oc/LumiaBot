@@ -13,11 +13,14 @@ interface TemplateVariables {
 // Cache for loaded prompts
 const promptCache: Map<string, string | object> = new Map();
 
+const COUNCIL_PROFILE_PATTERN = /<council-profile>\s*([\s\S]*?)\s*<\/council-profile>/i;
+
 // Default template variables (can be overridden at runtime)
 let templateVariables: TemplateVariables = {
   botName: 'Bad Kitty',
   botFamily: '',
   bot_family: '',
+  councilName: '',
   ownerName: 'Prolix',
   ownerId: '944783522059673691',
   ownerUsername: 'prolix_oc',
@@ -106,11 +109,34 @@ export function loadJsonFile<T = any>(relativePath: string, useCache: boolean = 
 export function getBotIdentity(): string {
   const identity = loadTextFile('persona/identity.txt');
   if (identity) {
-    return substituteVariables(identity);
+    return substituteVariables(identity.replace(COUNCIL_PROFILE_PATTERN, '').replace(/\n{3,}/g, '\n\n').trim());
   }
   
   // Fallback default
   return 'You are a helpful Discord bot assistant. You provide clear, concise, and accurate responses to user questions.';
+}
+
+/**
+ * Extract a compact profile shared with other orchestrated bots.
+ * Place it inside persona/identity.txt as:
+ * <council-profile>appearance, voice, and address details</council-profile>
+ */
+export function getBotCouncilProfile(): string {
+  const identity = loadTextFile('persona/identity.txt');
+  if (!identity) {
+    return '';
+  }
+
+  const match = identity.match(COUNCIL_PROFILE_PATTERN);
+  if (!match?.[1]) {
+    return '';
+  }
+
+  return substituteVariables(match[1])
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, 2000);
 }
 
 /**

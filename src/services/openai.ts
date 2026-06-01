@@ -8,10 +8,11 @@ import { guildMemoryService } from './guild-memory';
 import { boredomService } from './boredom';
 import { videoService } from './video';
 import { knowledgeGraphService } from './knowledge-graph';
-import type { KnowledgeCandidate } from './knowledge-graph';
 import { musicService, type MusicTrackWithDetails } from './music';
 import { userActivityService, type MusicActivity } from './user-activity';
+import { lrclibService } from './lrclib';
 import type { ResolveUserMention } from './user-mention-resolver';
+import { isNsfwImagePrompt, swarmUIService, type GeneratedImageAttachment } from './swarmui';
 import { getBotDefinition } from '../utils/bot-definition';
 import {
   getVideoReactionInstructions,
@@ -97,7 +98,6 @@ export interface ChatCompletionOptions {
   videos?: { url: string; mimeType?: string }[]; // URLs of videos to include (Gemini 3 only)
   textAttachments?: { name: string; content: string }[]; // Text file attachments
   pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
-  knowledgeCandidates?: KnowledgeCandidate[];
   collectiveKnowledgeContext?: string;
   userId?: string; // Discord user ID for memory
   username?: string; // Discord username for memory
@@ -121,6 +121,8 @@ export interface ChatCompletionOptions {
   orchestratorTurnId?: string;
   requestFollowUp?: (eventId: string, turnId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
   requestCollectiveKnowledge?: (query: string, maxResults?: number) => Promise<string>;
+  allowNsfwImageGeneration?: boolean;
+  onImageGenerated?: (image: GeneratedImageAttachment) => void;
 }
 
 export interface ToolExecutionSnapshot {
@@ -225,7 +227,17 @@ export class OpenAIService {
       const thinking = this.rawBodyParams?.thinking as { type?: string } | undefined;
       const thinkingDisabled = thinking?.type === 'disabled';
       params.temperature = thinkingDisabled ? 0.6 : 1.0;
-      console.log(`🧠 [AI] Moonshot thinking model detected, temperature set to ${params.temperature} (thinking ${thinkingDisabled ? 'disabled' : 'enabled'})`);
+      if (!thinkingDisabled) {
+        // Thinking models split max_tokens between reasoning_content and the
+        // visible answer. Too small a budget truncates/empties the reply, which
+        // trips the empty-response retry loop. Moonshot recommends >= 16000; we
+        // floor at 32000 to leave generous room for deep multi-tool reasoning.
+        const MIN_THINKING_MAX_TOKENS = 32000;
+        if ((params.max_tokens ?? 0) < MIN_THINKING_MAX_TOKENS) {
+          params.max_tokens = MIN_THINKING_MAX_TOKENS;
+        }
+      }
+      console.log(`🧠 [AI] Moonshot thinking model detected, temperature set to ${params.temperature} (thinking ${thinkingDisabled ? 'disabled' : 'enabled'}), max_tokens=${params.max_tokens}`);
       return;
     }
   }
@@ -340,7 +352,7 @@ export class OpenAIService {
     filtered = filtered.replace(/<\/tool_code>/gi, '');
 
     // Remove standalone tool function calls like store_user_opinion(...)
-    filtered = filtered.replace(/\b(store_user_opinion|get_user_opinion|list_users_with_opinions|web_search|get_knowledge_document|get_music_taste|search_music_library|get_user_current_listening)\s*\([^)]*\)/gi, '');
+    filtered = filtered.replace(/\b(store_user_opinion|get_user_opinion|list_users_with_opinions|web_search|search_knowledge_base|get_knowledge_document|get_music_taste|search_music_library|get_user_current_listening|generate_selfie)\s*\([^)]*\)/gi, '');
 
     // Remove action/action_input format (common in LangChain-style tool calls)
     // Matches: {"action": "...", "action_input": "..."} or variations
@@ -635,7 +647,9 @@ export class OpenAIService {
     conversationSummary?: string,
     textAttachments?: { name: string; content: string }[],
     mentionedUsers?: Map<string, string>,
-    pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]
+    pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[],
+    imageToolEnabled?: boolean,
+    allowNsfwImageGeneration?: boolean
   ): string {
     const botDefinition = getBotDefinition();
 
@@ -748,6 +762,10 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       systemPrompt += this.buildReplyContextPrompt(replyContext);
     }
 
+    if (imageToolEnabled) {
+      systemPrompt += this.buildImageGenerationInstructions(allowNsfwImageGeneration === true);
+    }
+
     if (orchestratorContextNote) {
       systemPrompt += `\n\n<orchestrator-session>\n${orchestratorContextNote}\n</orchestrator-session>`;
     }
@@ -779,6 +797,19 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     return systemPrompt;
+  }
+
+  private buildImageGenerationInstructions(allowNsfwImageGeneration: boolean): string {
+    const nsfwPolicy = allowNsfwImageGeneration
+      ? 'NSFW image generation is allowed for this request: this is an age-restricted NSFW context. When the user asks for an adult/explicit/nude/sexual image, or the conversation naturally leads there, lean into it and include the exact booru control tags "nsfw, explicit" in the tags argument; they will be lifted into the {{nsfwTags}} prompt macro. You may also control how much clothing is shown: to depict less clothing or full nudity when the user wants to see more (including specific body parts), include clothing-removal/exposure tags such as nude, naked, topless, bottomless, no clothes, or specific exposure tags (e.g. nipples) — these strip the bot\'s configured outfit. You may only reduce or remove the canonical outfit, never swap the bot into a different one. All depicted characters are adults.'
+      : 'NSFW image generation is not allowed for this request. If the user asks for an adult/explicit/nude/sexual image, refuse briefly in character and do not call generate_selfie. Do not mention system policy, tooling internals, permission checks, or channel metadata unless the user explicitly asks why.';
+
+    return `\n\n<image-generation>
+The generate_selfie tool creates an image attachment of you, the bot. There is no separate generate_image tool; when the user asks for a generated image/picture/photo/pic/render/drawing/portrait/selfie of you or your appearance, use generate_selfie instead of only describing what you would look like.
+Use the user's wording and the live conversation context to build concise comma-separated Danbooru/Gelbooru-style tags. The tags argument may ONLY contain facial expression tags, pose tags, arm/hand movement tags, background tags, location tags, lighting tags, the allowed NSFW control tags listed below, and — when the NSFW policy below permits it — clothing-state and nudity/exposure tags. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, or physical appearance tags; those are fixed by the configured base prompt, not the tool output.
+Do not call generate_selfie when the user is asking you to analyze, caption, edit, or react to an attached image/video rather than asking you to create a new image.
+${nsfwPolicy}
+</image-generation>`;
   }
 
   /**
@@ -871,7 +902,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
   }
 
   async createChatCompletion(options: ChatCompletionOptions): Promise<string> {
-    const { messages, enableSearch, enableKnowledgeGraph, temperature, maxTokens, images, videos, textAttachments, pageContents, knowledgeCandidates, collectiveKnowledgeContext, userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
+    const { messages, enableSearch, enableKnowledgeGraph, temperature, maxTokens, images, videos, textAttachments, pageContents, collectiveKnowledgeContext, userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -892,12 +923,15 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
     // Get last message content for music detection
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
-    const knowledgeCandidateContext = knowledgeCandidates && knowledgeCandidates.length > 0
-      ? knowledgeGraphService.formatCandidateContext(knowledgeCandidates)
+    const imageToolEnabled = swarmUIService.isConfigured();
+    const hasLocalKnowledge = enableKnowledgeGraph !== false && knowledgeGraphService.hasDocuments();
+
+    const knowledgeInstruction = hasLocalKnowledge
+      ? `<knowledge-base-instruction>\nYou have an internal knowledge base containing Lumiverse documentation (user guides, developer docs, API reference). When the user asks about Lumiverse features, setup, how-to questions, configuration, extensions, presets, characters, chatting, world books, councils, image generation, or any product-related topic, you MUST call search_knowledge_base before answering. Do not rely on memory alone for product questions — always search first.\n</knowledge-base-instruction>`
       : undefined;
 
-    // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeCandidateContext, collectiveKnowledgeContext, boredomAction, orchestratorContextNote, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
+    // Build system prompt with user memory, guild context, and knowledge instruction
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeInstruction, collectiveKnowledgeContext, boredomAction, orchestratorContextNote, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents, imageToolEnabled, options.allowNsfwImageGeneration);
 
     // Convert image URLs to base64 data URIs so external APIs can access them
     let processedImages = images;
@@ -983,13 +1017,13 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
     const provider: 'moonshot' | 'other' = isMoonshotProvider() ? 'moonshot' : 'other';
     const moonshotThinkingModel = isMoonshotThinkingModel();
-    const hasKnowledgeCandidates = !!(options.knowledgeCandidates && options.knowledgeCandidates.length > 0);
+    const knowledgeToolEnabled = enableKnowledgeGraph !== false && knowledgeGraphService.hasDocuments();
 
     // Determine if we need tools at all
     // Search is attached by default unless explicitly disabled.
     // Knowledge is attached when documents exist unless explicitly disabled.
     const hasUserContext = !!(userId && username);
-    const needsTools = enableSearch !== false || hasKnowledgeCandidates || hasUserContext || musicService.hasTracks() || !!options.getUserListeningActivity || !!options.resolveUserMention || !!options.orchestratorEventId || !!options.requestCollectiveKnowledge;
+    const needsTools = enableSearch !== false || knowledgeToolEnabled || hasUserContext || musicService.hasTracks() || imageToolEnabled || !!options.getUserListeningActivity || !!options.resolveUserMention || !!options.orchestratorEventId || !!options.requestCollectiveKnowledge;
 
     if (!needsTools) {
       console.log(`\n🌐 [AI] No tools needed (no user context or search) - normal completion`);
@@ -1044,7 +1078,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       
       // Define the web search function
       const webSearchFunction = async (args: { query: string }) => {
-        console.log(`🌐 [AI] AI requested search: "${args.query}"`);
+        console.log(`🌐 [TOOL CALL] web_search: query="${args.query}"`);
         try {
           const results = await searxngService.search(args.query);
           const formatted = searxngService.formatResultsForLLM(results);
@@ -1066,8 +1100,8 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: Cannot store opinion - user information not available.';
         }
         
-        console.log(`💭 [AI MEMORY] Storing opinion about ${username}: "${args.opinion.substring(0, 50)}..." (${args.sentiment})`);
-        
+        console.log(`💭 [TOOL CALL] store_user_opinion: user="${username}", sentiment="${args.sentiment}"`);
+
         try {
           userMemoryService.storeOpinion(userId, username, args.opinion, args.sentiment);
           return `Successfully stored your opinion about ${username}. You can reference this in future conversations.`;
@@ -1078,7 +1112,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       };
 
       const getUserOpinionFunction = async (args: { username: string }) => {
-        console.log(`💭 [AI MEMORY] Retrieving opinion about ${args.username}`);
+        console.log(`💭 [TOOL CALL] get_user_opinion: username="${args.username}"`);
 
         try {
           const opinion = userMemoryService.getOpinionByUsername(args.username);
@@ -1095,7 +1129,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       };
 
       const listUsersFunction = async () => {
-        console.log(`💭 [AI MEMORY] Listing all users with opinions`);
+        console.log(`💭 [TOOL CALL] list_users_with_opinions`);
         
         try {
           const users = userMemoryService.listUsers();
@@ -1111,19 +1145,19 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         }
       };
 
-      const getKnowledgeDocumentFunction = async (args: { docId: number }) => {
-        console.log(`📚 [AI KNOWLEDGE] Fetching knowledge document ${args.docId}`);
-
+      const searchKnowledgeBaseFunction = async (args: { query: string; maxResults?: number }) => {
+        console.log(`📚 [TOOL CALL] search_knowledge_base: query="${args.query}"`);
         try {
-          const allowedCandidates = options.knowledgeCandidates || [];
-          const isAllowed = allowedCandidates.some((candidate) => candidate.id === args.docId);
-          if (!isAllowed) {
-            const allowedList = allowedCandidates.length > 0
-              ? allowedCandidates.map((candidate) => `${candidate.id}:${candidate.title}`).join(', ')
-              : 'none';
-            return `Error: Doc ID ${args.docId} is not in the current deterministic candidate list. Allowed candidates: ${allowedList}.`;
-          }
+          return knowledgeGraphService.searchForTool(args.query, args.maxResults || 5);
+        } catch (error) {
+          console.error('📚 [AI KNOWLEDGE] Search failed:', error);
+          return 'Error: Failed to search the knowledge base.';
+        }
+      };
 
+      const getKnowledgeDocumentFunction = async (args: { docId: number }) => {
+        console.log(`📚 [TOOL CALL] get_knowledge_document: docId=${args.docId}`);
+        try {
           return knowledgeGraphService.getDocumentToolPayload(args.docId);
         } catch (error) {
           console.error('📚 [AI KNOWLEDGE] Failed to fetch knowledge document:', error);
@@ -1133,7 +1167,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
       // Define music taste function
       const getMusicTasteFunction = async () => {
-        console.log(`🎵 [AI MUSIC] Getting music taste context`);
+        console.log(`🎵 [TOOL CALL] get_music_taste`);
         
         try {
           const stats = musicService.getStats();
@@ -1186,7 +1220,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       };
 
       const searchMusicLibraryFunction = async (args: { query: string; maxResults?: number }) => {
-        console.log(`🎵 [AI MUSIC] Searching music library for "${args.query}"`);
+        console.log(`🎵 [TOOL CALL] search_music_library: query="${args.query}"`);
 
         try {
           const results = musicService.searchLibrary(args.query, args.maxResults || 5);
@@ -1212,6 +1246,30 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         }
       };
 
+      const generateSelfieFunction = async (args: { tags: string }) => {
+        const tags = String(args.tags || '').trim();
+        if (!tags) {
+          return 'Error: Selfie generation requires descriptive visual tags.';
+        }
+
+        if (isNsfwImagePrompt(tags) && !options.allowNsfwImageGeneration) {
+          return 'Error: NSFW image generation is not permitted in this context.';
+        }
+
+        console.log(`🖼️ [TOOL CALL] generate_selfie: tags="${tags.slice(0, 100)}${tags.length > 100 ? '...' : ''}"`);
+
+        try {
+          const image = await swarmUIService.generateSelfie(tags);
+          options.onImageGenerated?.(image);
+          console.log(`🖼️ [TOOL CALL] generate_selfie: completed (${image.name}, ${image.data.length} bytes)`);
+          return 'Selfie generated successfully and attached to the Discord reply. Respond in character with a lively, playful one-liner or short flourish that fits your persona and the user\'s request. Do not paste the full image prompt unless asked.';
+        } catch (error) {
+          console.error('🖼️  [AI IMAGE] SwarmUI selfie generation failed:', error);
+          const message = error instanceof Error ? error.message : String(error);
+          return `Error: Failed to generate selfie with SwarmUI. ${message}`;
+        }
+      };
+
       // Define user current listening function
       const getUserCurrentListeningFunction = async (args: { targetUserId?: string }) => {
         if (!options.getUserListeningActivity) {
@@ -1224,7 +1282,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
             return 'Error: No user specified to check listening activity.';
           }
           
-          console.log(`🎧 [AI] Checking listening activity for user: ${targetUserId}`);
+          console.log(`🎧 [TOOL CALL] get_user_current_listening: userId="${targetUserId}"`);
           const activity = await options.getUserListeningActivity(targetUserId);
           
           if (!activity) {
@@ -1237,12 +1295,32 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
             if (activity.albumName) {
               result += `\n💿 Album: ${activity.albumName}`;
             }
+            let durationSec: number | undefined;
             if (activity.timestamps?.start && activity.timestamps?.end) {
               const duration = activity.timestamps.end - activity.timestamps.start;
+              durationSec = duration / 1000;
               const minutes = Math.floor(duration / 60000);
               const seconds = Math.floor((duration % 60000) / 1000);
               result += `\n⏱️ Duration: ${minutes}:${seconds.toString().padStart(2, '0')}`;
             }
+
+            // Fold in lyrics from LRCLib when available
+            try {
+              const lyrics = await lrclibService.getLyrics(
+                activity.trackName,
+                activity.artistName,
+                activity.albumName,
+                durationSec,
+              );
+              if (lyrics?.instrumental) {
+                result += `\n\n🎤 Lyrics: (instrumental — no lyrics)`;
+              } else if (lyrics?.plainLyrics) {
+                result += `\n\n🎤 **Lyrics:**\n${lyrics.plainLyrics}`;
+              }
+            } catch (lyricsError) {
+              console.error('🎤 [AI] Error fetching lyrics:', lyricsError);
+            }
+
             return result;
           } else {
             return `🎧 They are currently listening to: ${activity.state || activity.trackName || 'music'}`;
@@ -1258,7 +1336,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: User mention resolution is not available in this context.';
         }
 
-        console.log(`👥 [AI] Resolving user mention for "${args.query}"`);
+        console.log(`👥 [TOOL CALL] resolve_user_mention: query="${args.query}"`);
 
         try {
           const results = await options.resolveUserMention(args.query, args.maxResults || 5);
@@ -1286,7 +1364,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
       // Define user pronouns function
       const getUserPronounsFunction = async (args: { username: string }) => {
-        console.log(`💭 [AI MEMORY] Retrieving pronouns for ${args.username}`);
+        console.log(`💭 [TOOL CALL] get_user_pronouns: username="${args.username}"`);
 
         try {
           const opinion = userMemoryService.getOpinionByUsername(args.username);
@@ -1302,7 +1380,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
       // Define search users function (fuzzy name matching)
       const searchUsersFunction = async (args: { query: string; maxResults?: number }) => {
-        console.log(`💭 [AI MEMORY] Searching users matching "${args.query}"`);
+        console.log(`💭 [TOOL CALL] search_users: query="${args.query}"`);
 
         try {
           const results = userMemoryService.searchUsers(args.query, args.maxResults || 5);
@@ -1333,7 +1411,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         mentionedByUsername: string;
         context: string;
       }) => {
-        console.log(`💭 [AI MEMORY] Storing third-party context about ${args.mentionedUsername}`);
+        console.log(`💭 [TOOL CALL] store_third_party_context: about="${args.mentionedUsername}" by="${args.mentionedByUsername}"`);
         
         try {
           userMemoryService.storeThirdPartyContext({
@@ -1356,7 +1434,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: Cannot clear history - user or guild information not available.';
         }
         
-        console.log(`💬 [AI HISTORY] Clearing conversation history for ${username}`);
+        console.log(`💬 [TOOL CALL] clear_conversation_history: user="${username}"`);
         
         try {
           conversationHistoryService.clearHistory(userId, guildId);
@@ -1372,7 +1450,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: Cannot get message count - user or guild information not available.';
         }
         
-        console.log(`💬 [AI HISTORY] Getting message count for ${username}`);
+        console.log(`💬 [TOOL CALL] get_message_count: user="${username}"`);
         
         try {
           const count = conversationHistoryService.getMessageCount(userId, guildId);
@@ -1390,7 +1468,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: Cannot set boredom preference - user or guild information not available.';
         }
         
-        console.log(`😴 [AI BOREDOM] Setting boredom preference: ${args.enabled}`);
+        console.log(`😴 [TOOL CALL] set_boredom_preference: enabled=${args.enabled}`);
         
         try {
           boredomService.setEnabled(userId, guildId, args.enabled);
@@ -1410,7 +1488,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: Cannot get boredom stats - user or guild information not available.';
         }
         
-        console.log(`😴 [AI BOREDOM] Getting boredom stats for ${username}`);
+        console.log(`😴 [TOOL CALL] get_boredom_stats: user="${username}"`);
         
         try {
           const stats = boredomService.getStats(userId, guildId);
@@ -1436,7 +1514,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           return 'Error: Cannot list guild users - guild information not available.';
         }
         
-        console.log(`😴 [AI BOREDOM] Listing users with boredom settings in guild`);
+        console.log(`😴 [TOOL CALL] list_guild_users_with_boredom`);
         
         try {
           const users = boredomService.listGuildUsers(guildId);
@@ -1457,15 +1535,14 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       // Build tools array
       const now = new Date();
       const currentDate = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-      const knowledgeCandidates = options.knowledgeCandidates || [];
-      const knowledgeToolEnabled = enableKnowledgeGraph !== false && knowledgeCandidates.length > 0;
-      const knowledgeSummary = knowledgeToolEnabled
-        ? knowledgeGraphService.formatCandidateSummary(knowledgeCandidates)
-        : '';
+      const knowledgeSummary = knowledgeToolEnabled ? knowledgeGraphService.getToolSummary(8) : '';
       const musicToolEnabled = musicService.hasTracks();
       const musicSummary = musicToolEnabled ? musicService.getToolSummary(4) : '';
 
       const tools: any[] = [];
+      const imageSafetyDescription = options.allowNsfwImageGeneration
+        ? 'This is an age-restricted NSFW channel, so adult/explicit/nude/sexual image tags are permitted. When the user requests a spicy image or the scene naturally calls for one, lean into it and include the exact booru control tags nsfw, explicit in the tags argument. You may also reduce or fully remove the bot\'s clothing with explicit tags like nude, naked, topless, bottomless, or no clothes (these override the configured outfit); never dress the bot in a different outfit. All depicted characters are adults.'
+        : 'Do not generate adult, explicit, nude, sexual, or otherwise NSFW images. If the user asks for NSFW image generation, refuse briefly in character instead of calling this tool. Do not mention system policy, tooling internals, permission checks, or channel metadata unless the user explicitly asks why.';
 
       // Web search tool - attach by default and let the model decide based on user intent
       if (enableSearch !== false) {
@@ -1490,21 +1567,45 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         });
       }
 
-      // Knowledge document tool - raw fetch only from deterministic candidates
+      // Knowledge base tools - LLM-directed search + document retrieval
       if (knowledgeToolEnabled) {
+        tools.push({
+          type: 'function',
+          function: {
+            function: searchKnowledgeBaseFunction,
+            parse: JSON.parse,
+            description: `Search your internal knowledge base for Lumiverse documentation — user guides, developer docs, API reference, and feature explanations. You MUST call this tool whenever the user asks about Lumiverse features, setup, how-to questions, configuration, extensions, presets, characters, chatting, world books, council, image generation, or any product-related topic. Do not guess from memory — always search first. Available: ${knowledgeSummary}`,
+            name: 'search_knowledge_base',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description: 'A focused search query based on what the user is asking about. Use specific terms related to the topic.',
+                },
+                maxResults: {
+                  type: 'number',
+                  description: 'Maximum number of results to return (default: 5).',
+                },
+              },
+              required: ['query'],
+            },
+          },
+        });
+
         tools.push({
           type: 'function',
           function: {
             function: getKnowledgeDocumentFunction,
             parse: JSON.parse,
-            description: `Fetch the full raw content of one of the deterministic knowledge candidates already matched for this message. Only use doc IDs from this list: ${knowledgeSummary}`,
+            description: 'Fetch the full content of a knowledge document by its ID. Use this after search_knowledge_base to get the complete text of a document whose preview looked relevant.',
             name: 'get_knowledge_document',
             parameters: {
               type: 'object',
               properties: {
                 docId: {
                   type: 'number',
-                  description: 'The document ID from the deterministic knowledge candidate list in the prompt.',
+                  description: 'The document ID from a previous search_knowledge_base result.',
                 },
               },
               required: ['docId'],
@@ -1553,6 +1654,28 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
         });
       }
 
+      if (imageToolEnabled) {
+        tools.push({
+          type: 'function',
+          function: {
+            function: generateSelfieFunction,
+            parse: JSON.parse,
+            description: `Generate a selfie image attachment of yourself, the bot, with SwarmUI. Use this when the user asks for a generated image, picture, photo, pic, render, drawing, portrait, selfie, what you look like, or a bot self-portrait. ${imageSafetyDescription} The tags argument may ONLY contain facial expressions, poses, arm/hand movements, backgrounds, locations, lighting, allowed NSFW control tags, and (when the NSFW policy permits) clothing-state and nudity/exposure tags. Choose exactly one selfie framing preset and do not mix the two presets: (1) mirror selfie preset: mirror selfie, mirror, reflection, looking at mirror, holding phone, cellphone, smartphone, phone screen, bathroom, mirror frame, indoor. (2) front camera selfie preset: selfie, pov, self shot, close-up. You may add expression, pose, arm/hand gesture, background, location, and lighting tags when useful. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, physical appearance, or negative tags; those are handled by configured prompts.`,
+            name: 'generate_selfie',
+            parameters: {
+              type: 'object',
+              properties: {
+                tags: {
+                  type: 'string',
+                  description: `Comma-separated positive Danbooru/Gelbooru-style tags for the bot selfie. ${imageSafetyDescription} Allowed categories only: facial expressions, poses, arm/hand movements, backgrounds, locations, lighting, allowed NSFW control tags, and (when the NSFW policy permits) clothing-state and nudity/exposure tags. Choose exactly one framing preset: mirror selfie tags (mirror selfie, mirror, reflection, looking at mirror, holding phone, cellphone, smartphone, phone screen, bathroom, mirror frame, indoor) OR front camera tags (selfie, pov, self shot, close-up). Do not mix both presets. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, physical appearance, or negative tags.`,
+                },
+              },
+              required: ['tags'],
+            },
+          },
+        });
+      }
+
       // Add user current listening tool if callback is provided
       if (options.getUserListeningActivity) {
         tools.push({
@@ -1560,7 +1683,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
           function: {
             function: getUserCurrentListeningFunction,
             parse: JSON.parse,
-            description: 'Check what music a user is currently listening to on Spotify or other platforms. Use this when someone asks "what are you listening to", "what song is that", or when discussing music taste interactively. CRITICAL: Use the MENTIONED user\'s ID if someone was pinged, or the current user\'s ID if they ask about themselves. Do NOT use a user from conversation history unless explicitly asked.',
+            description: 'Check what music a user is currently listening to on Spotify or other platforms. For Spotify tracks this also returns the song lyrics (via LRCLib) when available. Use this when someone asks "what are you listening to", "what song is that", "what are the lyrics", or when discussing music taste interactively. CRITICAL: Use the MENTIONED user\'s ID if someone was pinged, or the current user\'s ID if they ask about themselves. Do NOT use a user from conversation history unless explicitly asked.',
             name: 'get_user_current_listening',
             parameters: {
               type: 'object',
@@ -1853,7 +1976,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           function: {
             function: async (args: { reason: string }) => {
               const result = await requestFollowUpFn(eventId, turnId, undefined, args.reason);
-              console.log(`🔧 [AI] Follow-up request result: ${result.approved ? 'approved' : 'denied'} (${result.reason})`);
+              console.log(`🔧 [TOOL CALL] request_follow_up: reason="${args.reason}" → ${result.approved ? 'approved' : 'denied'}`);
               if (result.approved) {
                 return 'Follow-up request approved! You will get another turn after the other bot(s) respond. Continue with your current response for now.';
               } else {
@@ -1884,7 +2007,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           function: {
             function: async (args: { query: string; maxResults?: number }) => {
               const result = await requestCollectiveKnowledgeFn(args.query, args.maxResults);
-              console.log('📚 [AI] Collective knowledge query completed');
+              console.log(`📚 [TOOL CALL] query_collective_knowledge: query="${args.query}"`);
               return result;
             },
             parse: JSON.parse,
@@ -2101,7 +2224,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
   }
 
   async *streamChatCompletion(options: ChatCompletionOptions): AsyncGenerator<string> {
-    const { messages, temperature, maxTokens, images, videos, textAttachments, pageContents, knowledgeCandidates, collectiveKnowledgeContext, userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
+    const { messages, temperature, maxTokens, images, videos, textAttachments, pageContents, collectiveKnowledgeContext, userId, username, guildId, replyContext, boredomAction, orchestratorContextNote, enableMusicTaste = false, conversationSummary, mentionedUsers } = options;
 
     // Check if this is a multimodal request
     const isMultimodal = (images && images.length > 0) || (videos && videos.length > 0);
@@ -2136,12 +2259,15 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
     // Get last message content for music detection
     const lastMessageContent = messages[messages.length - 1]?.content?.toString() || '';
-    const knowledgeCandidateContext = knowledgeCandidates && knowledgeCandidates.length > 0
-      ? knowledgeGraphService.formatCandidateContext(knowledgeCandidates)
+    const imageToolEnabled = swarmUIService.isConfigured();
+    const hasLocalKnowledge = (options.enableKnowledgeGraph !== false) && knowledgeGraphService.hasDocuments();
+
+    const knowledgeInstruction = hasLocalKnowledge
+      ? `<knowledge-base-instruction>\nYou have an internal knowledge base containing Lumiverse documentation (user guides, developer docs, API reference). When the user asks about Lumiverse features, setup, how-to questions, configuration, extensions, presets, characters, chatting, world books, councils, image generation, or any product-related topic, you MUST call search_knowledge_base before answering. Do not rely on memory alone for product questions — always search first.\n</knowledge-base-instruction>`
       : undefined;
 
-    // Build system prompt with user memory, guild context, and knowledge
-    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeCandidateContext, collectiveKnowledgeContext, boredomAction, orchestratorContextNote, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents);
+    // Build system prompt with knowledge instruction
+    const systemPrompt = this.buildSystemPrompt(userId, username, guildId, hasVideos, replyContext, knowledgeInstruction, collectiveKnowledgeContext, boredomAction, orchestratorContextNote, enableMusicTaste, lastMessageContent, conversationSummary, textAttachments, mentionedUsers, pageContents, imageToolEnabled, options.allowNsfwImageGeneration);
 
     // Build the per-turn user message prefix: datetime reminder + persona directive.
     const now = new Date();

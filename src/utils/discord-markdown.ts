@@ -1,5 +1,6 @@
-const MARKDOWN_CHARS = new Set(['*', '_', '~', '`', '|', '>', '[', ']', '(', ')']);
+const MARKDOWN_CHARS = new Set(['*', '_', '~', '`', '|', '>', '[', ']', '(', ')', '#']);
 const URL_PATTERN = /https?:\/\/[^\s<>()]+/gi;
+const FENCE_PATTERN = /^\s*```/;
 
 function hasOddBackslashPrefix(text: string, index: number): boolean {
   let count = 0;
@@ -28,7 +29,8 @@ function escapeMarkdownSegment(segment: string): string {
 }
 
 /**
- * Escape Discord Markdown formatting in model text while leaving bare URLs intact.
+ * Escape Discord Markdown formatting in unsafe dynamic text, such as usernames.
+ * Bare URLs are left intact so Discord can still auto-link them.
  */
 export function escapeDiscordMarkdown(text: string): string {
   let escaped = '';
@@ -47,10 +49,30 @@ export function escapeDiscordMarkdown(text: string): string {
   return escaped;
 }
 
-export function formatDiscordResponseText(text: string, maxLength = 1950): string {
-  const escaped = escapeDiscordMarkdown(text);
+function escapeDiscordHeaders(text: string): string {
+  const lines = text.split('\n');
+  let inFence = false;
 
-  return escaped.length > maxLength
-    ? `${escaped.slice(0, maxLength)}... (message truncated)`
-    : escaped;
+  return lines.map((line) => {
+    if (FENCE_PATTERN.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+
+    if (inFence) {
+      return line;
+    }
+
+    // Discord renders leading # markers as headers. Keep regular markdown,
+    // but neutralize headers because they are too visually loud for bot replies.
+    return line.replace(/^(\s{0,3})(#{1,6})(?=\s)/, '$1\\$2');
+  }).join('\n');
+}
+
+export function formatDiscordResponseText(text: string, maxLength = 1950): string {
+  const formatted = escapeDiscordHeaders(text);
+
+  return formatted.length > maxLength
+    ? `${formatted.slice(0, maxLength)}... (message truncated)`
+    : formatted;
 }

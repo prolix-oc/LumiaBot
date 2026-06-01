@@ -4,14 +4,15 @@ import { getBotDefinition } from '../utils/bot-definition';
 import { searxngService } from './searxng';
 import { userMemoryService, PRONOUN_FALLBACK } from './user-memory';
 import { knowledgeGraphService } from './knowledge-graph';
-import type { KnowledgeCandidate } from './knowledge-graph';
 import { musicService } from './music';
 import { videoService } from './video';
 import { boredomService } from './boredom';
 import { conversationHistoryService } from './conversation-history';
 import { guildMemoryService } from './guild-memory';
 import { userActivityService, type MusicActivity } from './user-activity';
+import { lrclibService } from './lrclib';
 import type { ResolveUserMention } from './user-mention-resolver';
+import { isNsfwImagePrompt, swarmUIService, type GeneratedImageAttachment } from './swarmui';
 import {
   getVideoReactionInstructions,
   getBoredomUpdateInstructions,
@@ -75,7 +76,6 @@ export interface ChatCompletionOptions {
   videos?: { url: string; mimeType?: string }[]; // URLs of videos to include (Gemini 3 only)
   textAttachments?: { name: string; content: string }[]; // Text file attachments
   pageContents?: { url: string; title: string; content: string; excerpt?: string; siteName?: string; byline?: string }[]; // Extracted web page contents
-  knowledgeCandidates?: KnowledgeCandidate[];
   collectiveKnowledgeContext?: string;
   userId?: string;
   username?: string;
@@ -99,6 +99,8 @@ export interface ChatCompletionOptions {
   orchestratorTurnId?: string; // The current orchestrator turn ID
   requestFollowUp?: (eventId: string, turnId: string, targetBotId?: string, reason?: string) => Promise<{ approved: boolean; reason: string }>;
   requestCollectiveKnowledge?: (query: string, maxResults?: number) => Promise<string>;
+  allowNsfwImageGeneration?: boolean;
+  onImageGenerated?: (image: GeneratedImageAttachment) => void;
 }
 
 /**
@@ -450,6 +452,10 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       }
     }
 
+    if (swarmUIService.isConfigured()) {
+      systemPrompt += this.buildImageGenerationInstructions(options.allowNsfwImageGeneration === true);
+    }
+
     // Persona reinforcement — end-of-prompt anchor to counteract history drift
     const reinforcement = getPersonaReinforcement();
     if (reinforcement) {
@@ -457,6 +463,19 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     return systemPrompt;
+  }
+
+  private buildImageGenerationInstructions(allowNsfwImageGeneration: boolean): string {
+    const nsfwPolicy = allowNsfwImageGeneration
+      ? 'NSFW image generation is allowed for this request: this is an age-restricted NSFW context. When the user asks for an adult/explicit/nude/sexual image, or the conversation naturally leads there, lean into it and include the exact booru control tags "nsfw, explicit" in the tags argument; they will be lifted into the {{nsfwTags}} prompt macro. You may also control how much clothing is shown: to depict less clothing or full nudity when the user wants to see more (including specific body parts), include clothing-removal/exposure tags such as nude, naked, topless, bottomless, no clothes, or specific exposure tags (e.g. nipples) — these strip the bot\'s configured outfit. You may only reduce or remove the canonical outfit, never swap the bot into a different one. All depicted characters are adults.'
+      : 'NSFW image generation is not allowed for this request. If the user asks for an adult/explicit/nude/sexual image, refuse briefly in character and do not call generate_selfie. Do not mention system policy, tooling internals, permission checks, or channel metadata unless the user explicitly asks why.';
+
+    return `\n\n<image-generation>
+The generate_selfie tool creates an image attachment of you, the bot. There is no separate generate_image tool; when the user asks for a generated image/picture/photo/pic/render/drawing/portrait/selfie of you or your appearance, use generate_selfie instead of only describing what you would look like.
+Use the user's wording and the live conversation context to build concise comma-separated Danbooru/Gelbooru-style tags. The tags argument may ONLY contain facial expression tags, pose tags, arm/hand movement tags, background tags, location tags, lighting tags, the allowed NSFW control tags listed below, and — when the NSFW policy below permits it — clothing-state and nudity/exposure tags. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, or physical appearance tags; those are fixed by the configured base prompt, not the tool output.
+Do not call generate_selfie when the user is asking you to analyze, caption, edit, or react to an attached image/video rather than asking you to create a new image.
+${nsfwPolicy}
+</image-generation>`;
   }
 
   /**
@@ -558,13 +577,14 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     // Web search tool
     const now = new Date();
     const currentDate = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-    const knowledgeCandidates = options.knowledgeCandidates || [];
-    const knowledgeToolEnabled = options.enableKnowledgeGraph !== false && knowledgeCandidates.length > 0;
-    const knowledgeSummary = knowledgeToolEnabled
-      ? knowledgeGraphService.formatCandidateSummary(knowledgeCandidates)
-      : '';
+    const knowledgeToolEnabled = options.enableKnowledgeGraph !== false && knowledgeGraphService.hasDocuments();
+    const knowledgeSummary = knowledgeToolEnabled ? knowledgeGraphService.getToolSummary(8) : '';
     const musicToolEnabled = musicService.hasTracks();
     const musicSummary = musicToolEnabled ? musicService.getToolSummary(4) : '';
+    const imageToolEnabled = swarmUIService.isConfigured();
+    const imageSafetyDescription = options.allowNsfwImageGeneration
+      ? 'This is an age-restricted NSFW channel, so adult/explicit/nude/sexual image tags are permitted. When the user requests a spicy image or the scene naturally calls for one, lean into it and include the exact booru control tags nsfw, explicit in the tags argument. You may also reduce or fully remove the bot\'s clothing with explicit tags like nude, naked, topless, bottomless, or no clothes (these override the configured outfit); never dress the bot in a different outfit. All depicted characters are adults.'
+      : 'Do not generate adult, explicit, nude, sexual, or otherwise NSFW images. If the user asks for NSFW image generation, refuse briefly in character instead of calling this tool. Do not mention system policy, tooling internals, permission checks, or channel metadata unless the user explicitly asks why.';
     
     if (options.enableSearch !== false) {
       tools.push({
@@ -583,17 +603,36 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       });
     }
     
-    // Knowledge document tool - raw fetch only from deterministic candidates
+    // Knowledge base tools - LLM-directed search + document retrieval
     if (knowledgeToolEnabled) {
       tools.push({
+        name: 'search_knowledge_base',
+        description: `Search your internal knowledge base for Lumiverse documentation — user guides, developer docs, API reference, and feature explanations. You MUST call this tool whenever the user asks about Lumiverse features, setup, how-to questions, configuration, extensions, presets, characters, chatting, world books, council, image generation, or any product-related topic. Do not guess from memory — always search first. Available: ${knowledgeSummary}`,
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: 'A focused search query based on what the user is asking about. Use specific terms related to the topic.',
+            },
+            maxResults: {
+              type: Type.NUMBER,
+              description: 'Maximum number of results to return (default: 5).',
+            },
+          },
+          required: ['query'],
+        },
+      });
+
+      tools.push({
         name: 'get_knowledge_document',
-        description: `Fetch the full raw content of one of the deterministic knowledge candidates already matched for this message. Only use doc IDs from this list: ${knowledgeSummary}`,
+        description: 'Fetch the full content of a knowledge document by its ID. Use this after search_knowledge_base to get the complete text of a document whose preview looked relevant.',
         parameters: {
           type: Type.OBJECT,
           properties: {
             docId: {
               type: Type.NUMBER,
-              description: 'The document ID from the deterministic knowledge candidate list in the prompt.',
+              description: 'The document ID from a previous search_knowledge_base result.',
             },
           },
           required: ['docId'],
@@ -678,11 +717,28 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
       });
     }
 
+    if (imageToolEnabled) {
+      tools.push({
+        name: 'generate_selfie',
+        description: `Generate a selfie image attachment of yourself, the bot, with SwarmUI. Use this when the user asks for a generated image, picture, photo, pic, render, drawing, portrait, selfie, what you look like, or a bot self-portrait. ${imageSafetyDescription} The tags argument may ONLY contain facial expressions, poses, arm/hand movements, backgrounds, locations, lighting, allowed NSFW control tags, and (when the NSFW policy permits) clothing-state and nudity/exposure tags. Choose exactly one selfie framing preset and do not mix the two presets: (1) mirror selfie preset: mirror selfie, mirror, reflection, looking at mirror, holding phone, cellphone, smartphone, phone screen, bathroom, mirror frame, indoor. (2) front camera selfie preset: selfie, pov, self shot, close-up. You may add expression, pose, arm/hand gesture, background, location, and lighting tags when useful. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, physical appearance, or negative tags; those are handled by configured prompts.`,
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            tags: {
+              type: Type.STRING,
+              description: `Comma-separated positive Danbooru/Gelbooru-style tags for the bot selfie. ${imageSafetyDescription} Allowed categories only: facial expressions, poses, arm/hand movements, backgrounds, locations, lighting, allowed NSFW control tags, and (when the NSFW policy permits) clothing-state and nudity/exposure tags. Choose exactly one framing preset: mirror selfie tags (mirror selfie, mirror, reflection, looking at mirror, holding phone, cellphone, smartphone, phone screen, bathroom, mirror frame, indoor) OR front camera tags (selfie, pov, self shot, close-up). Do not mix both presets. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, physical appearance, or negative tags.`,
+            },
+          },
+          required: ['tags'],
+        },
+      });
+    }
+
     // User current listening tool - check what a user is currently listening to on Spotify
     if (options.getUserListeningActivity) {
       tools.push({
         name: 'get_user_current_listening',
-        description: 'Check what music a user is currently listening to on Spotify or other platforms. Use this when someone asks "what are you listening to", "what song is that", or when discussing music taste interactively. CRITICAL: Use the MENTIONED user\'s ID if someone was pinged, or the current user\'s ID if they ask about themselves. Do NOT use a user from conversation history unless explicitly asked.',
+        description: 'Check what music a user is currently listening to on Spotify or other platforms. For Spotify tracks this also returns the song lyrics (via LRCLib) when available. Use this when someone asks "what are you listening to", "what song is that", "what are the lyrics", or when discussing music taste interactively. CRITICAL: Use the MENTIONED user\'s ID if someone was pinged, or the current user\'s ID if they ask about themselves. Do NOT use a user from conversation history unless explicitly asked.',
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -925,7 +981,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
   ): Promise<string> {
     const { name, args } = functionCall;
     
-    console.log(`🔧 [Google GenAI] Executing function: ${name}(${JSON.stringify(args)})`);
+    console.log(`🔧 [TOOL CALL] ${name}: ${JSON.stringify(args)}`);
     
     try {
       switch (name) {
@@ -936,19 +992,14 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           return formatted;
         }
         
-        case 'get_knowledge_document': {
-          const allowedCandidates = options.knowledgeCandidates || [];
-          const isAllowed = allowedCandidates.some((candidate) => candidate.id === args.docId);
-          if (!isAllowed) {
-            const allowedList = allowedCandidates.length > 0
-              ? allowedCandidates.map((candidate) => `${candidate.id}:${candidate.title}`).join(', ')
-              : 'none';
-            return `Error: Doc ID ${args.docId} is not in the current deterministic candidate list. Allowed candidates: ${allowedList}.`;
-          }
+        case 'search_knowledge_base': {
+          console.log(`📚 [TOOL CALL] search_knowledge_base: query="${args.query}"`);
+          return knowledgeGraphService.searchForTool(args.query, args.maxResults || 5);
+        }
 
-          const document = knowledgeGraphService.getDocumentToolPayload(args.docId);
-          console.log(`🔧 [Google GenAI] Knowledge document fetch completed`);
-          return document;
+        case 'get_knowledge_document': {
+          console.log(`📚 [TOOL CALL] get_knowledge_document: docId=${args.docId}`);
+          return knowledgeGraphService.getDocumentToolPayload(args.docId);
         }
         
         case 'store_user_opinion': {
@@ -1045,6 +1096,30 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
           return response;
         }
 
+        case 'generate_selfie': {
+          const tags = String(args.tags || '').trim();
+          if (!tags) {
+            return 'Error: Selfie generation requires descriptive visual tags.';
+          }
+
+          if (isNsfwImagePrompt(tags) && !options.allowNsfwImageGeneration) {
+            return 'Error: NSFW image generation is not permitted in this context.';
+          }
+
+          console.log(`🖼️  [Google GenAI] Generating SwarmUI selfie with tags: ${tags.slice(0, 160)}${tags.length > 160 ? '...' : ''}`);
+
+          try {
+            const image = await swarmUIService.generateSelfie(tags);
+            options.onImageGenerated?.(image);
+            console.log(`🖼️  [Google GenAI] SwarmUI selfie generated: ${image.name} (${image.data.length} bytes)`);
+            return 'Selfie generated successfully and attached to the Discord reply. Respond in character with a lively, playful one-liner or short flourish that fits your persona and the user\'s request. Do not paste the full image prompt unless asked.';
+          } catch (error) {
+            console.error('🖼️  [Google GenAI] SwarmUI selfie generation failed:', error);
+            const message = error instanceof Error ? error.message : String(error);
+            return `Error: Failed to generate selfie with SwarmUI. ${message}`;
+          }
+        }
+
         case 'get_user_current_listening': {
           if (!options.getUserListeningActivity) {
             return 'Error: Unable to check listening activity - service not available.';
@@ -1069,12 +1144,32 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
               if (activity.albumName) {
                 result += `\n💿 Album: ${activity.albumName}`;
               }
+              let durationSec: number | undefined;
               if (activity.timestamps?.start && activity.timestamps?.end) {
                 const duration = activity.timestamps.end - activity.timestamps.start;
+                durationSec = duration / 1000;
                 const minutes = Math.floor(duration / 60000);
                 const seconds = Math.floor((duration % 60000) / 1000);
                 result += `\n⏱️ Duration: ${minutes}:${seconds.toString().padStart(2, '0')}`;
               }
+
+              // Fold in lyrics from LRCLib when available
+              try {
+                const lyrics = await lrclibService.getLyrics(
+                  activity.trackName,
+                  activity.artistName,
+                  activity.albumName,
+                  durationSec,
+                );
+                if (lyrics?.instrumental) {
+                  result += `\n\n🎤 Lyrics: (instrumental — no lyrics)`;
+                } else if (lyrics?.plainLyrics) {
+                  result += `\n\n🎤 **Lyrics:**\n${lyrics.plainLyrics}`;
+                }
+              } catch (lyricsError) {
+                console.error('🎤 [Google GenAI] Error fetching lyrics:', lyricsError);
+              }
+
               return result;
             } else {
               return `🎧 They are currently listening to: ${activity.state || activity.trackName || 'music'}`;
@@ -1577,13 +1672,14 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
       const { images, videos } = options;
       const hasVideos = !!(videos && videos.length > 0);
-      const knowledgeCandidateContext = options.knowledgeCandidates && options.knowledgeCandidates.length > 0
-        ? knowledgeGraphService.formatCandidateContext(options.knowledgeCandidates)
+      const hasLocalKnowledge = options.enableKnowledgeGraph !== false && knowledgeGraphService.hasDocuments();
+      const knowledgeInstruction = hasLocalKnowledge
+        ? `<knowledge-base-instruction>\nYou have an internal knowledge base containing Lumiverse documentation (user guides, developer docs, API reference). When the user asks about Lumiverse features, setup, how-to questions, configuration, extensions, presets, characters, chatting, world books, councils, image generation, or any product-related topic, you MUST call search_knowledge_base before answering. Do not rely on memory alone for product questions — always search first.\n</knowledge-base-instruction>`
         : undefined;
-      
-      // Build enhanced system prompt with all context
-      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeCandidateContext, options.collectiveKnowledgeContext);
-      
+
+      // Build enhanced system prompt with knowledge instruction
+      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeInstruction, options.collectiveKnowledgeContext);
+
       // Convert messages (system prompt will be used instead of extracting from messages)
       let { contents } = await this.convertMessages(options.messages, images, videos);
 
@@ -1613,7 +1709,7 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
       // Use retry logic to handle empty responses
       const content = await this.generateWithRetry(contents, genConfig, options);
-      
+
       console.log(`🔮 [Google GenAI] Response received: ${content.length} chars`);
 
       return content;
@@ -1635,12 +1731,13 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
 
       const { images, videos } = options;
       const hasVideos = !!(videos && videos.length > 0);
-      const knowledgeCandidateContext = options.knowledgeCandidates && options.knowledgeCandidates.length > 0
-        ? knowledgeGraphService.formatCandidateContext(options.knowledgeCandidates)
+      const hasLocalKnowledge = options.enableKnowledgeGraph !== false && knowledgeGraphService.hasDocuments();
+      const knowledgeInstruction = hasLocalKnowledge
+        ? `<knowledge-base-instruction>\nYou have an internal knowledge base containing Lumiverse documentation (user guides, developer docs, API reference). When the user asks about Lumiverse features, setup, how-to questions, configuration, extensions, presets, characters, chatting, world books, councils, image generation, or any product-related topic, you MUST call search_knowledge_base before answering. Do not rely on memory alone for product questions — always search first.\n</knowledge-base-instruction>`
         : undefined;
-      
-      // Build enhanced system prompt with all context
-      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeCandidateContext, options.collectiveKnowledgeContext);
+
+      // Build enhanced system prompt with knowledge instruction
+      const systemPrompt = this.buildSystemPrompt(options, hasVideos, knowledgeInstruction, options.collectiveKnowledgeContext);
       
       // Convert messages (system prompt will be used instead of extracting from messages)
       const { contents } = await this.convertMessages(options.messages, images, videos);

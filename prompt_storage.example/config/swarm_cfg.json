@@ -1,0 +1,19 @@
+{
+  "enabled": false,
+  "apiUrl": "http://localhost:7801",
+  "apiKey": "",
+  "model": "",
+  "timeoutMs": 120000,
+  "outputFilename": "swarmui.png",
+  "booruTagSeparator": "underscores",
+  "parameters": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 20,
+    "cfgScale": 7,
+    "seed": -1,
+    "sampler": "",
+    "scheduler": ""
+  },
+  "rawRequestOverride": {}
+}

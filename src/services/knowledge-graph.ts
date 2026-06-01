@@ -362,6 +362,33 @@ export class KnowledgeGraphService {
     }));
   }
 
+  searchForTool(query: string, maxResults: number = 5): string {
+    const results = this.searchByKeywords({ query, maxResults });
+
+    if (results.length === 0) {
+      return `No knowledge documents matched the query "${query}".`;
+    }
+
+    const entries = results.map((result, i) => {
+      const doc = result.document;
+      const preview = this.buildPreview(doc.content, 500);
+      const urlLine = doc.url ? `\nURL: ${doc.url}` : '';
+      return `${i + 1}. [Doc ID ${doc.id}] ${doc.title}\n   Topic: ${doc.topic}${urlLine}\n   Preview: ${preview}`;
+    });
+
+    this.incrementUsageForResults(results);
+
+    return `Found ${results.length} knowledge document(s) for "${query}":\n\n${entries.join('\n\n')}\n\nUse get_knowledge_document with a Doc ID to retrieve the full content of any document above.`;
+  }
+
+  private incrementUsageForResults(results: KnowledgeSearchResult[]): void {
+    for (const result of results) {
+      if (result.document.id) {
+        this.incrementUsage(result.document.id);
+      }
+    }
+  }
+
   formatCandidateContext(candidates: KnowledgeCandidate[]): string {
     if (candidates.length === 0) {
       return '';
@@ -540,27 +567,10 @@ ${sections.join('\n\n')}
       return 'No knowledge documents are currently loaded.';
     }
 
-    const rows = this.db.query(
-      `SELECT title, topic, keywords
-       FROM knowledge_documents
-       ORDER BY priority DESC, usage_count DESC, title ASC
-       LIMIT ?`
-    ).all(limit) as Array<{ title: string; topic: string; keywords: string }>;
+    const topics = this.listTopics();
+    const topicSummary = topics.slice(0, 10).join(', ');
 
-    const topics = this.listTopics().slice(0, 6);
-    const topicSummary = topics.length > 0 ? topics.join(', ') : 'none listed';
-
-    const documents = rows.map((row) => {
-      const keywords = (JSON.parse(row.keywords || '[]') as string[]).slice(0, 3);
-      const keywordSummary = keywords.length > 0 ? `; keywords: ${keywords.join(', ')}` : '';
-      return `"${row.title}" (topic: ${row.topic}${keywordSummary})`;
-    });
-
-    const remaining = stats.totalDocuments > rows.length
-      ? ` There are ${stats.totalDocuments - rows.length} more documents beyond this preview.`
-      : '';
-
-    return `Knowledge base has ${stats.totalDocuments} documents across ${stats.totalTopics} topics. Topics: ${topicSummary}. Document preview: ${documents.join('; ')}.${remaining}`;
+    return `${stats.totalDocuments} documents across ${stats.totalTopics} topics: ${topicSummary}.`;
   }
 
   private buildPreview(content: string, maxLength: number = 220): string {

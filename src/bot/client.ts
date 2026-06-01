@@ -1,9 +1,9 @@
-import { Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember, StickerFormatType, userMention } from 'discord.js';
+import { AttachmentBuilder, Client, Collection, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, NewsChannel, VoiceChannel, StageChannel, DMChannel, GuildMember, StickerFormatType, userMention, type Channel } from 'discord.js';
 import { config } from '../utils/config';
 import { shouldTriggerBot, extractMessageContent, handleMessage, extractTriggerKeywords } from '../services/message-handler';
 import { boredomService, getRandomBoredomMessage } from '../services/boredom';
 import { channelHistoryService } from '../services/channel-history';
-import { getErrorMessage, getTriggerKeywords } from '../services/prompts';
+import { getBotCouncilProfile, getErrorMessage, getTriggerKeywords } from '../services/prompts';
 import { userActivityService } from '../services/user-activity';
 import { userMemoryService } from '../services/user-memory';
 import { pageExtractorService } from '../services/page-extractor';
@@ -14,6 +14,7 @@ import { LumiaBotIntegration } from '../services/orchestrator';
 import { orchestratorTurnJournal } from '../services/orchestrator/turn-journal';
 import type { MessageContext, ReplyContext, MediaAttachment, TextAttachment, ResponseRequestPayload, CollectiveKnowledgeResultPayload } from '../services/orchestrator/types';
 import type { ResolvedUserMention, ResolveUserMention } from '../services/user-mention-resolver';
+import type { GeneratedImageAttachment } from '../services/swarmui';
 
 export interface Command {
   data: {
@@ -88,6 +89,28 @@ function extractStickerMedia(
   }
 
   return { imageUrls, videoUrls, stickerHints };
+}
+
+/**
+ * Extract custom emoji CDN URLs from message content so the AI model can see them.
+ * Custom emojis appear as <:name:id> (static) or <a:name:id> (animated).
+ */
+function extractCustomEmojiUrls(content: string, logPrefix: string): string[] {
+  const emojiRegex = /<(a?):(\w+):(\d+)>/g;
+  const urls: string[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = emojiRegex.exec(content)) !== null) {
+    const animated = match[1] === 'a';
+    const name = match[2];
+    const id = match[3];
+    const ext = animated ? 'gif' : 'png';
+    const url = `https://cdn.discordapp.com/emojis/${id}.${ext}?size=96&quality=lossless`;
+    urls.push(url);
+    console.log(`😀 [${logPrefix}] Custom emoji: :${name}: (${url})`);
+  }
+
+  return urls;
 }
 
 // Patterns for detecting boredom opt-in/opt-out intent
@@ -205,6 +228,45 @@ function buildAllowedMentions(userIds: Iterable<string>) {
   };
 }
 
+function buildDiscordImageFiles(attachments: GeneratedImageAttachment[]): AttachmentBuilder[] {
+  return attachments.map((attachment) => new AttachmentBuilder(attachment.data, {
+    name: attachment.name,
+  }));
+}
+
+function isDiscordNsfwChannel(channel: Message['channel'] | Channel | null | undefined): boolean {
+  if (!channel) {
+    return false;
+  }
+
+  if ('nsfw' in channel && channel.nsfw === true) {
+    return true;
+  }
+
+  if (channel instanceof ThreadChannel && channel.parent && 'nsfw' in channel.parent) {
+    return channel.parent.nsfw === true;
+  }
+
+  return false;
+}
+
+function canUserRequestNsfwImages(channel: Message['channel'], userId?: string): boolean {
+  // NSFW image generation always requires an NSFW-marked channel.
+  if (!isDiscordNsfwChannel(channel)) {
+    return false;
+  }
+
+  // When the bot is globally locked to NSFW channels, the channel gate alone is
+  // sufficient — every responder is already in an age-restricted space, so any
+  // user may request NSFW image generation (no owner check needed).
+  if (config.bot.nsfwOnly) {
+    return true;
+  }
+
+  // Otherwise, NSFW image generation stays owner-only.
+  return !!userId && userId === config.bot.ownerId;
+}
+
 export class DiscordBot {
   public client: Client;
   public commands: Collection<string, Command>;
@@ -243,10 +305,10 @@ export class DiscordBot {
 
   private buildOrchestratorContextNote(context: MessageContext): string | undefined {
     const lines: string[] = [];
-    const councilFamilyName = context.councilFamilyName || config.orchestrator.familyName || config.bot.familyName;
+    const councilName = context.councilFamilyName || config.orchestrator.councilName || config.orchestrator.familyName;
 
-    if (councilFamilyName) {
-      lines.push(`You are part of the ${councilFamilyName}. Cooperate with the other ${councilFamilyName} as trusted sibling bots with shared context and complementary perspectives.`);
+    if (councilName) {
+      lines.push(`You are participating in the ${councilName} council. Cooperate with other council members as distinct bots with complementary perspectives, not necessarily as family or siblings.`);
     }
 
     if (context.sessionMode) {
@@ -267,7 +329,14 @@ export class DiscordBot {
     if (context.nearbyBots && context.nearbyBots.length > 0) {
       const botNames = context.nearbyBots.filter((bot) => bot.isOnline).map((bot) => bot.botName);
       if (botNames.length > 0) {
-        lines.push(`${councilFamilyName ? `Other active ${councilFamilyName} nearby` : 'Other active bots nearby'}: ${botNames.join(', ')}.`);
+        lines.push(`${councilName ? `Other active ${councilName} council members nearby` : 'Other active bots nearby'}: ${botNames.join(', ')}.`);
+      }
+
+      const profileLines = context.nearbyBots
+        .filter((bot) => bot.isOnline && bot.councilProfile)
+        .map((bot) => `${bot.botName}: ${bot.councilProfile}`);
+      if (profileLines.length > 0) {
+        lines.push(`Council member profiles for appearance and address context:\n${profileLines.join('\n\n')}`);
       }
     }
 
@@ -279,7 +348,7 @@ export class DiscordBot {
       lines.push('The orchestrator thinks this exchange is approaching a natural ending, so wrap cleanly unless there is a strong new hook.');
     }
 
-    lines.push(`Do not repeat or closely paraphrase an earlier ${councilFamilyName || 'bot'} message. Add a fresh angle, disagreement, synthesis, or question.`);
+    lines.push(`Do not repeat or closely paraphrase an earlier ${councilName || 'bot'} message. Add a fresh angle, disagreement, synthesis, or question.`);
 
     if (context.scratchpad) {
       lines.push(`Your scratchpad: turnsTaken=${context.scratchpad.turnsTaken}, suppressedResponses=${context.scratchpad.suppressedResponses}, unansweredQuestionsSeen=${context.scratchpad.unansweredQuestionsSeen}, noveltyPressure=${context.scratchpad.noveltyPressure.toFixed(2)}.`);
@@ -434,8 +503,7 @@ ${sections.join('\n\n')}
   }
 
   private canUseCollectiveKnowledge(): boolean {
-    return config.knowledge.sourceMode !== 0
-      && !!this.orchestrator
+    return !!this.orchestrator
       && this.orchestrator.isConnectedToOrchestrator();
   }
 
@@ -471,7 +539,10 @@ ${sections.join('\n\n')}
       metadata: {
         triggerKeywords: getTriggerKeywords().botMention,
         botFamilyName: config.bot.familyName || undefined,
-        councilFamilyName: config.orchestrator.familyName || undefined,
+        councilName: config.orchestrator.councilName || undefined,
+        councilFamilyName: config.orchestrator.councilName || undefined,
+        participatesInCouncil: config.orchestrator.councilParticipant,
+        councilProfile: getBotCouncilProfile() || undefined,
       },
       reconnectIntervalMs: config.orchestrator.reconnectIntervalMs,
       maxReconnectAttempts: config.orchestrator.maxReconnectAttempts,
@@ -547,6 +618,14 @@ ${sections.join('\n\n')}
     }
 
     const { message, replyContext, imageUrls, videoUrls, textAttachments } = queuedInfo;
+
+    // NSFW-only mode: never generate an orchestrated response outside an NSFW channel,
+    // even if the orchestrator grants this bot a turn (e.g. via a banter session).
+    if (config.bot.nsfwOnly && !isDiscordNsfwChannel(message.channel)) {
+      console.log(`🔞 [Orchestrator] NSFW-only mode: declining turn in non-NSFW channel ${message.channelId}`);
+      return '';
+    }
+
     const instanceId = this.orchestrator?.getInstanceId() ?? 'unknown';
     const generationKey = !context.replyToMessageId ? `root:${message.id}` : undefined;
 
@@ -591,6 +670,13 @@ ${sections.join('\n\n')}
       orchestratorTurnJournal.markGenerating(turnId, eventId, instanceId, payload);
 
       const isBotAuthoredTurn = lastMessage.isBot;
+      const allowNsfwImageGeneration = canUserRequestNsfwImages(
+        message.channel,
+        isBotAuthoredTurn ? undefined : lastMessage.authorId,
+      );
+      if (allowNsfwImageGeneration) {
+        console.log(`🔞 [Orchestrator] NSFW image generation enabled in NSFW channel ${message.channelId}`);
+      }
 
       // Extract mentioned users from the original Discord message.
       // In orchestrator mode the message content contains raw <@id> patterns;
@@ -702,6 +788,7 @@ ${sections.join('\n\n')}
         },
         getUserListeningActivity,
         resolveUserMention,
+        allowNsfwImageGeneration,
         // Orchestrator follow-up support: allow the LLM to request another turn
         orchestratorEventId: eventId,
         orchestratorTurnId: turnId,
@@ -736,6 +823,7 @@ ${sections.join('\n\n')}
           },
           getUserListeningActivity,
           resolveUserMention,
+          allowNsfwImageGeneration,
           orchestratorEventId: eventId,
           orchestratorTurnId: turnId,
           requestFollowUp: this.orchestrator
@@ -753,8 +841,8 @@ ${sections.join('\n\n')}
       orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, response.text, payload);
 
       // Send the response directly to Discord
-      if (response.text && response.text.trim()) {
-        const sentMessage = await this.sendOrchestratorResponseToDiscord(message, context, response.text, eventId, turnId, allowedMentionUserIds);
+      if ((response.text && response.text.trim()) || response.attachments.length > 0) {
+        const sentMessage = await this.sendOrchestratorResponseToDiscord(message, context, response.text, eventId, turnId, allowedMentionUserIds, response.attachments);
         if (!sentMessage) {
           orchestratorTurnJournal.markGenerated(turnId, eventId, instanceId, '', payload);
           return '';
@@ -820,6 +908,7 @@ ${sections.join('\n\n')}
     eventId: string,
     turnId: string,
     allowedMentionUserIds: Iterable<string> = [],
+    attachments: GeneratedImageAttachment[] = [],
   ): Promise<Message | null> {
     if (!context.replyToMessageId && this.hasAlreadyReplied(message.id)) {
       console.warn(`⚠️ [Orchestrator] Suppressing duplicate reply for message ${message.id} (orchestrator path blocked by cross-path guard)`);
@@ -830,18 +919,21 @@ ${sections.join('\n\n')}
 
     const formattedResponseText = formatDiscordResponseText(responseText);
     const allowedMentions = buildAllowedMentions(allowedMentionUserIds);
+    const files = buildDiscordImageFiles(attachments);
 
     let sentMessage;
     if (context.replyToMessageId && 'send' in message.channel) {
       sentMessage = await message.channel.send({
-        content: formattedResponseText,
+        content: formattedResponseText || undefined,
         allowedMentions,
+        files,
         reply: { messageReference: context.replyToMessageId, failIfNotExists: false },
       });
     } else {
       sentMessage = await message.reply({
-        content: formattedResponseText,
+        content: formattedResponseText || undefined,
         allowedMentions,
+        files,
         failIfNotExists: false,
       });
     }
@@ -1075,6 +1167,15 @@ ${sections.join('\n\n')}
       }
 
       try {
+        // NSFW-only mode: commands are usable only in channels marked NSFW.
+        if (config.bot.nsfwOnly && !isDiscordNsfwChannel(interaction.channel)) {
+          await interaction.reply({
+            content: 'I can only be used in age-restricted (NSFW) channels.',
+            ephemeral: true,
+          });
+          return;
+        }
+
         const subcommand = interaction.options.getSubcommand(false);
         const ownerOnly = command.ownerOnly ||
           (subcommand !== null && command.ownerOnlySubcommands?.includes(subcommand));
@@ -1232,6 +1333,10 @@ ${sections.join('\n\n')}
           embeddedImages.push(...referencedStickerMedia.imageUrls);
           embeddedVideos.push(...referencedStickerMedia.videoUrls);
 
+          // Extract custom emoji images from the referenced message
+          embeddedImages.push(...extractCustomEmojiUrls(referencedMessage.content, 'CLIENT'));
+
+
           const originalContentWithStickers = referencedStickerMedia.stickerHints.length > 0
             ? (referencedMessage.content
                 ? `${referencedMessage.content} ${referencedStickerMedia.stickerHints.join(' ')}`
@@ -1270,6 +1375,14 @@ ${sections.join('\n\n')}
       const shouldTrigger = hasTrigger || isReplyToLumia || (replyContext?.isReply && hasTrigger);
       
       let boredomAction: 'opted-in' | 'opted-out' | undefined;
+
+      // NSFW-only mode: the bot may only respond in channels marked NSFW.
+      // Reuses the same age-gating used for NSFW image generation, so DMs and
+      // non-NSFW channels are silently ignored regardless of trigger.
+      if (shouldTrigger && config.bot.nsfwOnly && !isDiscordNsfwChannel(message.channel)) {
+        console.log(`🔞 [CLIENT] NSFW-only mode: ignoring trigger in non-NSFW channel ${message.channelId}`);
+        return;
+      }
 
       if (shouldTrigger) {
         // Check if orchestrator should handle this mention
@@ -1446,6 +1559,9 @@ ${sections.join('\n\n')}
       imageUrls.push(...stickerMedia.imageUrls);
       videoUrls.push(...stickerMedia.videoUrls);
 
+      // Extract custom emoji images from message content so the model can see them.
+      imageUrls.push(...extractCustomEmojiUrls(message.content, 'CLIENT'));
+
       // Identify URLs that will be scraped for page content, so we can skip their embed images
       const scrapedUrls = config.pageExtraction.enabled
         ? pageExtractorService.extractUrls(cleanedContent)
@@ -1559,6 +1675,10 @@ ${sections.join('\n\n')}
         `direct-${message.id}`,
         message.guildId || undefined,
       );
+      const allowNsfwImageGeneration = canUserRequestNsfwImages(message.channel, message.author.id);
+      if (allowNsfwImageGeneration) {
+        console.log(`🔞 [CLIENT] NSFW image generation enabled in NSFW channel ${message.channelId}`);
+      }
 
       // Generate response with tool availability attached for model-directed use
       const response = await handleMessage({
@@ -1582,6 +1702,7 @@ ${sections.join('\n\n')}
         channelMessages: channelTurns,
         getUserListeningActivity,
         resolveUserMention,
+        allowNsfwImageGeneration,
         requestCollectiveKnowledge,
       });
 
@@ -1606,14 +1727,16 @@ ${sections.join('\n\n')}
         return;
       }
 
-      // Send the text response
+      // Send the text response and any generated image attachments
       // Use failIfNotExists: false to handle cases where the message being replied to
       // is a forwarded message or has been deleted
       let sentMessage;
+      const files = buildDiscordImageFiles(response.attachments);
       try {
         sentMessage = await message.reply({
-          content: formattedResponse,
+          content: formattedResponse || undefined,
           allowedMentions,
+          files,
           failIfNotExists: false,
         });
       } catch (replyError) {
@@ -1631,8 +1754,9 @@ ${sections.join('\n\n')}
             message.channel instanceof StageChannel ||
             message.channel instanceof DMChannel) {
           sentMessage = await message.channel.send({
-            content: `${message.author} ${formattedResponse}`,
+            content: formattedResponse ? `${message.author} ${formattedResponse}` : `${message.author}`,
             allowedMentions: buildAllowedMentions([...allowedMentionUserIds, message.author.id]),
+            files,
           });
         } else {
           throw replyError;
@@ -1693,6 +1817,12 @@ ${sections.join('\n\n')}
       const channel = await this.client.channels.fetch(channelId);
       if (!channel || !channel.isTextBased()) {
         console.log(`😴 [BOREDOM] Channel ${channelId} not found or not text-based`);
+        return;
+      }
+
+      // NSFW-only mode: never proactively ping outside an NSFW channel.
+      if (config.bot.nsfwOnly && !isDiscordNsfwChannel(channel)) {
+        console.log(`🔞 [BOREDOM] NSFW-only mode: skipping ping in non-NSFW channel ${channelId}`);
         return;
       }
 
@@ -1830,6 +1960,10 @@ ${sections.join('\n\n')}
     const stickerMedia = extractStickerMedia(message, 'Orchestrator');
     imageUrls.push(...stickerMedia.imageUrls);
     videoUrls.push(...stickerMedia.videoUrls);
+
+    // Extract custom emoji images from message content so the model can see them.
+    imageUrls.push(...extractCustomEmojiUrls(message.content, 'Orchestrator'));
+
     const notifyContent = stickerMedia.stickerHints.length > 0
       ? (message.content
           ? `${message.content} ${stickerMedia.stickerHints.join(' ')}`
