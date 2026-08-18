@@ -8,6 +8,7 @@
     "dev": "bun --hot run src/index.ts",
     "register-commands": "bun run src/scripts/register-commands.ts",
     "wipe-memories": "bun run src/scripts/wipe-memories.ts",
+    "reattribute-memories": "bun run src/scripts/reattribute-memories.ts",
     "import-docs": "bun run src/scripts/import-lumiverse-docs.ts"
   },
   "dependencies": {

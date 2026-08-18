@@ -215,6 +215,19 @@ Once the bot is running and invited to your server, use these slash commands:
   - `category`: (Optional) Filter by category (general, images, news, science, files)
   - `timerange`: (Optional) Filter by time (day, month, year)
 
+### Reattributing an account's stored memories
+
+If someone changes Discord accounts, stop the bot and preview the migration first:
+
+```bash
+bun run reattribute-memories OLD_DISCORD_USER_ID NEW_DISCORD_USER_ID
+```
+
+If the preview has no conflicts, apply it with `--force`. The script backs up the
+three affected databases before moving long-term memories, conversation history,
+and boredom settings. It refuses to guess how to merge existing target memories
+or per-guild boredom settings; resolve those conflicts manually first.
+
 ## Project Structure
 
 ```

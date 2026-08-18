@@ -14,6 +14,12 @@ import { lrclibService } from './lrclib';
 import type { ResolveUserMention } from './user-mention-resolver';
 import { isNsfwImagePrompt, swarmUIService, type GeneratedImageAttachment } from './swarmui';
 import {
+  buildImageGenerationInstructions,
+  buildImageSafetyDescription,
+  buildSelfieTagsParamDescription,
+  buildSelfieToolDescription,
+} from './image-prompt-guidance';
+import {
   getVideoReactionInstructions,
   getBoredomUpdateInstructions,
   getMusicTasteTemplate,
@@ -338,7 +344,7 @@ ${getBotDefinition()}
       const pronouns = userId ? userMemoryService.getPronouns(userId) : null;
       const pronounsAttr = pronouns ? ` pronouns="${pronouns}"` : '';
       systemPrompt += `\n\n<current-user name="${username}"${userId ? ` id="${userId}"` : ''}${pronounsAttr}>
-The current message author. Address THEM — not users from conversation history.
+The current human participant for this exchange. Usually address them directly, while also acknowledging relevant activity in the surrounding chat when it matters.
 If they mention @OtherUser, they are talking TO that user, not AS them.`;
 
       // Add explicitly mentioned users section if present
@@ -369,7 +375,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     // PRIORITY 3b: Message context note — explain that the turns are the live channel
-    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking and who is being addressed. The final turn is the active message you are responding to; in orchestrator mode it may be from another bot rather than from a human. If a <current-user> block is present, that identifies the active human speaker for this exchange. If you see transcript blocks like <orchestrator-bot-message> or <orchestrator-user-message>, treat them as quoted messages from distinct participants. Bot-tagged transcript blocks are not your persona unless they appear as assistant-role turns.\n</message-context-note>`;
+    systemPrompt += `\n\n<message-context-note>\nThe conversation messages that follow are the live channel discussion. Multiple participants may be active — pay attention to who is speaking, who is being addressed, and what is happening around the current exchange. The last turn is the immediate conversation event for this response; in orchestrator mode it may be from another bot rather than from a human. Respond naturally to the useful live context without describing prompt mechanics or message availability. If a <current-user> block is present, that identifies the active human speaker for this exchange, but you may also acknowledge relevant activity from other participants. If you see transcript blocks like <orchestrator-bot-message> or <orchestrator-user-message>, treat them as quoted messages from distinct participants. Bot-tagged transcript blocks are not your persona unless they appear as assistant-role turns.\n</message-context-note>`;
 
     // PRIORITY 5: Add reply-specific context (HIGHEST PRIORITY for this specific turn)
     if (replyContext?.isReply && replyContext.originalContent) {
@@ -453,7 +459,7 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     if (swarmUIService.isConfigured()) {
-      systemPrompt += this.buildImageGenerationInstructions(options.allowNsfwImageGeneration === true);
+      systemPrompt += buildImageGenerationInstructions(options.allowNsfwImageGeneration === true);
     }
 
     // Persona reinforcement — end-of-prompt anchor to counteract history drift
@@ -463,19 +469,6 @@ If they mention @OtherUser, they are talking TO that user, not AS them.`;
     }
 
     return systemPrompt;
-  }
-
-  private buildImageGenerationInstructions(allowNsfwImageGeneration: boolean): string {
-    const nsfwPolicy = allowNsfwImageGeneration
-      ? 'NSFW image generation is allowed for this request: this is an age-restricted NSFW context. When the user asks for an adult/explicit/nude/sexual image, or the conversation naturally leads there, lean into it and include the exact booru control tags "nsfw, explicit" in the tags argument; they will be lifted into the {{nsfwTags}} prompt macro. You may also control how much clothing is shown: to depict less clothing or full nudity when the user wants to see more (including specific body parts), include clothing-removal/exposure tags such as nude, naked, topless, bottomless, no clothes, or specific exposure tags (e.g. nipples) — these strip the bot\'s configured outfit. You may only reduce or remove the canonical outfit, never swap the bot into a different one. All depicted characters are adults.'
-      : 'NSFW image generation is not allowed for this request. If the user asks for an adult/explicit/nude/sexual image, refuse briefly in character and do not call generate_selfie. Do not mention system policy, tooling internals, permission checks, or channel metadata unless the user explicitly asks why.';
-
-    return `\n\n<image-generation>
-The generate_selfie tool creates an image attachment of you, the bot. There is no separate generate_image tool; when the user asks for a generated image/picture/photo/pic/render/drawing/portrait/selfie of you or your appearance, use generate_selfie instead of only describing what you would look like.
-Use the user's wording and the live conversation context to build concise comma-separated Danbooru/Gelbooru-style tags. The tags argument may ONLY contain facial expression tags, pose tags, arm/hand movement tags, background tags, location tags, lighting tags, the allowed NSFW control tags listed below, and — when the NSFW policy below permits it — clothing-state and nudity/exposure tags. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, or physical appearance tags; those are fixed by the configured base prompt, not the tool output.
-Do not call generate_selfie when the user is asking you to analyze, caption, edit, or react to an attached image/video rather than asking you to create a new image.
-${nsfwPolicy}
-</image-generation>`;
   }
 
   /**
@@ -582,9 +575,7 @@ ${nsfwPolicy}
     const musicToolEnabled = musicService.hasTracks();
     const musicSummary = musicToolEnabled ? musicService.getToolSummary(4) : '';
     const imageToolEnabled = swarmUIService.isConfigured();
-    const imageSafetyDescription = options.allowNsfwImageGeneration
-      ? 'This is an age-restricted NSFW channel, so adult/explicit/nude/sexual image tags are permitted. When the user requests a spicy image or the scene naturally calls for one, lean into it and include the exact booru control tags nsfw, explicit in the tags argument. You may also reduce or fully remove the bot\'s clothing with explicit tags like nude, naked, topless, bottomless, or no clothes (these override the configured outfit); never dress the bot in a different outfit. All depicted characters are adults.'
-      : 'Do not generate adult, explicit, nude, sexual, or otherwise NSFW images. If the user asks for NSFW image generation, refuse briefly in character instead of calling this tool. Do not mention system policy, tooling internals, permission checks, or channel metadata unless the user explicitly asks why.';
+    const imageSafetyDescription = buildImageSafetyDescription(options.allowNsfwImageGeneration === true);
     
     if (options.enableSearch !== false) {
       tools.push({
@@ -720,13 +711,13 @@ ${nsfwPolicy}
     if (imageToolEnabled) {
       tools.push({
         name: 'generate_selfie',
-        description: `Generate a selfie image attachment of yourself, the bot, with SwarmUI. Use this when the user asks for a generated image, picture, photo, pic, render, drawing, portrait, selfie, what you look like, or a bot self-portrait. ${imageSafetyDescription} The tags argument may ONLY contain facial expressions, poses, arm/hand movements, backgrounds, locations, lighting, allowed NSFW control tags, and (when the NSFW policy permits) clothing-state and nudity/exposure tags. Choose exactly one selfie framing preset and do not mix the two presets: (1) mirror selfie preset: mirror selfie, mirror, reflection, looking at mirror, holding phone, cellphone, smartphone, phone screen, bathroom, mirror frame, indoor. (2) front camera selfie preset: selfie, pov, self shot, close-up. You may add expression, pose, arm/hand gesture, background, location, and lighting tags when useful. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, physical appearance, or negative tags; those are handled by configured prompts.`,
+        description: buildSelfieToolDescription(imageSafetyDescription),
         parameters: {
           type: Type.OBJECT,
           properties: {
             tags: {
               type: Type.STRING,
-              description: `Comma-separated positive Danbooru/Gelbooru-style tags for the bot selfie. ${imageSafetyDescription} Allowed categories only: facial expressions, poses, arm/hand movements, backgrounds, locations, lighting, allowed NSFW control tags, and (when the NSFW policy permits) clothing-state and nudity/exposure tags. Choose exactly one framing preset: mirror selfie tags (mirror selfie, mirror, reflection, looking at mirror, holding phone, cellphone, smartphone, phone screen, bathroom, mirror frame, indoor) OR front camera tags (selfie, pov, self shot, close-up). Do not mix both presets. Do not include subject, species, gender, skin color, hair color, eye color, hairstyle, body type, accessory, physical appearance, or negative tags.`,
+              description: buildSelfieTagsParamDescription(imageSafetyDescription),
             },
           },
           required: ['tags'],
@@ -1449,21 +1440,29 @@ ONLY use this tool when you detect CLEAR, EXPLICIT intent to change boredom sett
   }
 
   /**
-   * Check if a response part contains thought content
-   * Filters out parts where thought flag is true or thoughtSignature is present
+   * Check if a response part is thought content and should be skipped.
+   * The param is a minimal structural view of the SDK's Part union.
    */
-  private isThoughtContent(part: any): boolean {
-    // Skip if explicitly marked as thought
+  private isThoughtContent(part: {
+    thought?: boolean;
+    thoughtSignature?: string;
+    text?: string;
+    functionCall?: { name?: string };
+    inlineData?: unknown;
+  }): boolean {
+    // Explicitly marked as a thought summary — always internal reasoning.
     if (part.thought === true) {
       return true;
     }
-    
-    // Skip if has thoughtSignature (even if thought flag is not set)
-    // This catches the dummy signature and any real signatures
+
+    // Some Gemini providers send an empty terminal STOP chunk whose only
+    // payload is a thoughtSignature, and relays merge that signature onto
+    // regular content parts. A signature alone is NOT a thought marker:
+    // only drop the part when it carries no usable payload at all.
     if (part.thoughtSignature) {
-      return true;
+      return !part.text && !part.functionCall && !part.inlineData;
     }
-    
+
     return false;
   }
 

@@ -813,7 +813,7 @@ ${sections.join('\n\n')}
           mentionedUsers,
           replyContext: effectiveReplyContext,
           channelMessages: orchestratorTurns.length > 0 ? orchestratorTurns : undefined,
-          orchestratorContextNote: `${orchestratorContextNote || ''}\nYour previous draft matched an earlier ${(config.orchestrator.familyName || config.bot.familyName || 'bot')} response too closely. Reply in a meaningfully different way or stay silent rather than repeating yourself.`.trim(),
+          orchestratorContextNote: `${orchestratorContextNote || ''}\nYour previous draft matched an earlier ${(config.orchestrator.familyName || config.bot.familyName || 'bot')} response too closely. Reply in a meaningfully different way, grounded in the live chat context, without repeating earlier wording or explaining that you cannot respond.`.trim(),
           currentMessageSpeaker: {
             authorId: lastMessage.authorId,
             authorName: lastMessage.authorName,

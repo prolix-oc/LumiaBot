@@ -51,6 +51,36 @@ const NUDITY_CONTROL_PATTERN = /\b(?:completely nude|fully nude|partially nude|n
 const NSFW_IMAGE_TAG_PATTERN = /\b(?:nsfw|explicit|rating[:_ -]?explicit|rating[:_ -]?questionable|nude|naked|nudity|topless|bottomless|sex|sexual|sexually|intercourse|penetration|oral|blowjob|handjob|cum|semen|ejaculat\w*|orgasm|masturbat\w*|genital\w*|vagina|vulva|penis|cock|dick|pussy|nipples?|areolae?|breasts?|boobs?|ass|butt|spread legs|cameltoe|upskirt|panties|lingerie|bdsm|bondage|fetish|porn|pornographic|erotic|hentai)\b/i;
 const DISALLOWED_TOOL_TAG_PATTERN = /\b(?:1girl|1boy|solo|female|male|woman|man|girl|boy|skin|pale|tan|dark skin|light skin|brown skin|black skin|white skin|hair|hairstyle|bangs|ponytail|twintails|braid|ahoge|blonde|brunette|redhead|blue eyes|green eyes|brown eyes|red eyes|purple eyes|pink eyes|yellow eyes|gray eyes|grey eyes|black eyes|white eyes|shirt|dress|skirt|pants|jeans|shorts|jacket|coat|hoodie|sweater|uniform|suit|tie|gloves|socks|shoes|boots|heels|hat|cap|collar|choker|panties|bra|lingerie|underwear|bikini|swimsuit|breasts?|boobs?|nipples?|areolae?|ass|butt|hips|thighs|genitals?|vagina|vulva|penis|cock|dick|pussy|petite|curvy|muscular|slim|fat|tall|short)\b/i;
 
+// Anatomical regions the model may legitimately FRAME or FOCUS a shot on. The
+// DISALLOWED pattern above blocks these same words to stop the model redefining the
+// bot's fixed body — but "ass focus" / "breast focus" / "from behind" describe
+// composition, not identity. When a tag matches this pattern (and carries no
+// size/shape adjective — see BODY_SHAPE_PATTERN) we keep it so region-focused
+// requests actually reach SwarmUI. These tags are NSFW-gated upstream by
+// isNsfwImagePrompt(), so the explicit ones only arrive when NSFW is permitted.
+// Unlike NUDITY_CONTROL_PATTERN they do NOT strip the outfit — baring a region still
+// requires a separate exposure tag.
+const ANATOMY_REGION =
+  'ass|asses|butt|buttocks|breast|breasts|boob|boobs|chest|cleavage|side ?boob|under ?boob|' +
+  'nipple|nipples|areola|areolae|thigh|thighs|hip|hips|leg|legs|feet|foot|sole|soles|toe|toes|' +
+  'navel|belly|stomach|abs|midriff|back|shoulder|shoulders|armpit|armpits|crotch|groin|pussy|vulva|vagina|cameltoe';
+const ANATOMY_FOCUS_PATTERN = new RegExp(
+  '\\b(?:' +
+    '(?:' + ANATOMY_REGION + ') ?focus|' +              // "ass focus", "breast focus"
+    'focus on (?:' + ANATOMY_REGION + ')|' +            // "focus on ass"
+    'presenting|bent over|spread (?:legs|ass|pussy|anus|thighs)|top-down bottom-up|' +
+    'from (?:behind|below|above|side)|looking back|downblouse|downpants|ass visible through thighs|' +
+    ANATOMY_REGION +                                    // bare region noun, e.g. "ass", "breasts"
+  ')\\b',
+  'i',
+);
+// Size / shape descriptors that DO redefine the bot's fixed body. A tag matching
+// ANATOMY_FOCUS_PATTERN is only kept when it does NOT also match this — so "ass focus"
+// survives but "huge ass" / "large breasts" / "thicc thighs" fall through to the
+// DISALLOWED filter, leaving body proportions to the configured base prompt.
+const BODY_SHAPE_PATTERN =
+  /\b(?:large|larger|largest|huge|big|bigger|biggest|giant|gigantic|massive|enormous|oversized|small|smaller|smallest|tiny|little|flat|petite|curvy|curvaceous|voluptuous|thicc|thick|busty|buxom|slim|slender|skinny|lean|fat|chubby|plump|wide|narrow|tall|short|saggy|perky)\b/i;
+
 export function isNsfwImagePrompt(tags: string): boolean {
   return NSFW_IMAGE_TAG_PATTERN.test(tags.replace(/[_-]+/g, ' '));
 }
@@ -215,6 +245,11 @@ class SwarmUIService {
         // clothing/anatomy filter) and strip the configured outfit block.
         regularTags.push(tag);
         removeOutfit = true;
+      } else if (this.isAnatomyFocusTag(normalized)) {
+        // Region framing/emphasis (ass focus, breast focus, from behind, …). Keep it
+        // so the shot can target the area the user asked for, but do NOT strip the
+        // outfit — baring the region still requires an explicit exposure tag above.
+        regularTags.push(tag);
       } else if (this.isAllowedToolTag(tag)) {
         regularTags.push(tag);
       } else {
@@ -241,6 +276,17 @@ class SwarmUIService {
 
   private isAllowedToolTag(tag: string): boolean {
     return !DISALLOWED_TOOL_TAG_PATTERN.test(tag.replace(/_/g, ' '));
+  }
+
+  /**
+   * Region-focus / composition tags (e.g. "ass focus", "breast focus", "from behind")
+   * that DISALLOWED_TOOL_TAG_PATTERN would otherwise strip. Kept so region-targeted
+   * requests work, but rejected when the tag also carries a size/shape adjective so
+   * the model can't redefine the bot's fixed proportions. Expects an already
+   * separator-normalised, lowercased tag (underscores/dashes → spaces).
+   */
+  private isAnatomyFocusTag(normalized: string): boolean {
+    return ANATOMY_FOCUS_PATTERN.test(normalized) && !BODY_SHAPE_PATTERN.test(normalized);
   }
 
   private normalizeBooruTags(cfg: SwarmConfig, toolTags: string): string[] {
